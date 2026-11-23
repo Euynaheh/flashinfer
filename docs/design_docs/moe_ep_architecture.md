@@ -1064,6 +1064,8 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 | `torch_dist` | split comm, all mega kernels |
 | `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl`, `sm100_bf16_nvfp4_bf16_cutedsl` (skip with `MEGA_NO_DIST=1`) |
 
+`sm120_mxfp4_mxfp8_bf16_cutedsl` needs only `torch_dist`: each multi-rank workspace creates its own NCCL 2.30.7 symmetric-memory session from the EP group. A same-NUMA EP world runs `p2p_direct`; an EP world spanning two NUMA nodes (EP8 on 2 x 4 GPUs) runs `p2p_split`, which keeps same-NUMA peers on P2P and synchronizes cross-NUMA shadow segments over NCCL GIN.
+
 **Host framework bootstrap (e.g. vLLM):** when the host already initialized `torch.distributed` and EP uses a subgroup, pass `BootstrapConfig(process_group=ep_group, world_size=ep_size, rank=ep_rank, auto_bootstrap=False)` and call `bootstrap_moe_ep_runtime(bootstrap, reqs)` once per worker after dist init. Mega kernels resolve comm via `bootstrap_comm_group` / `bootstrap_ep_rank_world` (`MegaKernelBackend.bind_ep_bootstrap`).
 
 When `auto_bootstrap=False`: dist must be up at layer construction if `process_group` is set; rank/world cross-checks run at init or first `forward()`; call `bootstrap_moe_ep_runtime` yourself.

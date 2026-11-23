@@ -389,7 +389,7 @@ def _sm120_gpus(n):
     )
 
 
-# cutedsl's FlashInfer shim needs NVSHMEM and does not capture on every SM120 SKU (RTX 6000D);
+# cutedsl's FlashInfer shim needs NCCL 2.30.7 and does not capture on every SM120 SKU (RTX 6000D);
 # opt in where it runs.
 _CUTEDSL = os.environ.get("FLASHINFER_TEST_SM120_CUTEDSL") == "1"
 

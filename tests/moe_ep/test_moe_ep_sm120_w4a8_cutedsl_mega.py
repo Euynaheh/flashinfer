@@ -345,12 +345,12 @@ def _problem(
     capacity: int = 64,
     skewed_routing: bool = False,
     seed_offset: int = 0,
+    experts: int = 8,
 ):
     from flashinfer.moe_ep import MoEWeightPack, MoEEpTensors
 
     hidden = 1024
     intermediate = 1024
-    experts = 8
     topk = 4
     assert experts % world_size == 0
     local_experts = experts // world_size
@@ -712,6 +712,100 @@ def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay(
             replays.append(captured.clone())
         torch.cuda.synchronize()
         dist.barrier()
+        for replay in replays:
+            torch.testing.assert_close(replays[0], replay, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(eager0, replays[0], atol=0.0, rtol=0.0)
+    finally:
+        layer.destroy()
+
+
+@pytest.mark.usefixtures("require_sm120_w4a8_green_context")
+@pytest.mark.gpu_8
+@pytest.mark.arch_sm120
+@pytest.mark.parametrize(
+    "tokens_by_rank,skewed_routing",
+    (
+        ((67, 64, 19, 1, 0, 7, 33, 64), False),
+        ((16, 16, 16, 16, 16, 16, 16, 16), True),
+        ((383, 192, 7, 0, 255, 1, 64, 300), True),
+    ),
+    ids=("decode-uneven", "decode-skewed", "bucket384-skewed"),
+)
+def test_sm120_w4a8_eight_rank_p2p_split_and_cuda_graph_replay(
+    tokens_by_rank: tuple[int, ...],
+    skewed_routing: bool,
+) -> None:
+    """EP8 on two NUMA nodes runs p2p_split (same-NUMA P2P + NCCL GIN)."""
+
+    import torch.distributed as dist
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size != 8:
+        pytest.skip("requires exactly eight ranks")
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    # Skewed routing sends every route to experts 0-7, owned by ranks 0-3
+    # (one NUMA node); the other node's owners receive zero-count records.
+    problem = _problem(
+        rank,
+        world_size,
+        tokens=tokens_by_rank[rank],
+        capacity=4096,
+        skewed_routing=skewed_routing,
+        experts=16,
+    )
+    small = _problem(
+        rank, world_size, tokens=7, capacity=4096, experts=16, seed_offset=23
+    )["inputs"]
+    layer = _make_layer(rank, world_size, problem)
+    bucket = max(tokens_by_rank)
+    try:
+        eager_outputs = []
+        for _ in range(2):
+            layer.stage_inputs(problem["inputs"], compile_tokens_per_rank=bucket)
+            eager_outputs.append(layer.compute_staged(output=None).clone())
+        eager0, eager1 = eager_outputs
+        torch.cuda.synchronize()
+        dist.barrier()
+        workspace = layer._workspace
+        compiled_bucket = workspace._compile_bucket
+        topology = workspace._topology
+        expected_backend = (
+            "p2p_split" if topology.cross_numa_peer_count else "p2p_direct"
+        )
+        assert workspace._comm_backend == expected_backend
+        if expected_backend == "p2p_split":
+            assert workspace._executions[compiled_bucket].xnuma is not None
+        torch.testing.assert_close(eager0, eager1, atol=0.0, rtol=0.0)
+
+        global_problem = _global_weight_problem(problem)
+        reference = (
+            _torch_reference(global_problem)
+            if tokens_by_rank[rank]
+            else torch.empty_like(problem["inputs"].hidden_states, dtype=torch.float32)
+        )
+        rel_l2 = (eager0.float() - reference).norm() / reference.norm().clamp_min(1e-6)
+        assert rel_l2.item() < 0.03, f"rank {rank} rel_l2={rel_l2.item():.5f}"
+
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            layer.stage_inputs(problem["inputs"], compile_tokens_per_rank=bucket)
+            captured = layer.compute_staged(output=None)
+        dist.barrier()
+        replays = []
+        replay_count = int(os.environ.get("FLASHINFER_MEGAMOE_REPLAY_ITERS", "16"))
+        for index in range(replay_count):
+            if index == replay_count // 2:
+                # Another bucket shares the cross-NUMA control region and
+                # epoch; graph replay must continue from its epoch.
+                layer.stage_inputs(small, compile_tokens_per_rank=7)
+                layer.compute_staged(output=None)
+            graph.replay()
+            replays.append(captured.clone())
+        torch.cuda.synchronize()
+        dist.barrier()
+        assert set(workspace._storages) == {7, compiled_bucket}
         for replay in replays:
             torch.testing.assert_close(replays[0], replay, atol=0.0, rtol=0.0)
         torch.testing.assert_close(eager0, replays[0], atol=0.0, rtol=0.0)
