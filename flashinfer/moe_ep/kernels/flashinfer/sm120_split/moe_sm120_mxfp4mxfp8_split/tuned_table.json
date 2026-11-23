@@ -332,18 +332,51 @@
      }
     },
     {
+     "tokens": 64,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_n": 16,
+      "k2_n": 32,
+      "k2_warps": 8,
+      "k1_ctas_per_sm": 2,
+      "k2_launch_factor": 2,
+      "k1_stages": 3,
+      "weight_prefetch_ahead": 4,
+      "fc1_utility_postprocess": "off",
+      "weight_eviction_policy": "default",
+      "k2_tail_reclaim": "on",
+      "dispatch_chunk_tokens": 32,
+      "k2_ready_queue_bundle": 2,
+      "sms": [
+       80,
+       0,
+       0,
+       30
+      ]
+     },
+     "p50_us": 985.1,
+     "default_us": 1258.5,
+     "confirm": {
+      "best_us": 990.2,
+      "default_us": 1255.9,
+      "seed": 6197
+     }
+    },
+    {
      "tokens": 128,
      "knobs": {
       "backend": "p2p_split",
       "k2_tail_reclaim": "on",
       "fc1_utility_postprocess": "on",
-      "weight_eviction_policy": "evict_first"
+      "weight_eviction_policy": "evict_first",
+      "k1_ctas_per_sm": 2,
+      "weight_prefetch_ahead": 4
      },
-     "p50_us": 1332.2,
-     "default_us": 1444.9,
+     "p50_us": 1085.4,
+     "default_us": 1367.0,
      "confirm": {
-      "best_us": 1366.0,
-      "default_us": 1471.0,
+      "best_us": 1082.4,
+      "default_us": 1371.1,
       "seed": 6197
      }
     },

@@ -1,7 +1,7 @@
 # SM120 W4A8 Split Kernel Drop
 
 This directory contains the SM120 MXFP4/MXFP8 split implementation at commit
-`89552a64b3405bba50fcec7b7d727ae22f7f5c06` (previous drop:
+`8f3d199e36220c1f26c0501d6ea01c4a5e98daed` (previous drop:
 `6aa25a07fe14afcf0c05323139551cd0533c07b0`).
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
@@ -26,6 +26,9 @@ Backends use its package exports rather than raw modules.
 - Measured anchor table (`tuned_table.py`/`.json`) for DSv4.1-Flash and
   GLM5.3-Flash on `ep4_1numa`, `ep8_2numa` and `ep16_2x2numa`, plus the
   calibrated decode policy (`model_policy.py`/`.json`).
+- 8f3d199 (on top of 89552a6; only `tuned_table.json` differs) retunes the
+  DSv4.1-Flash EP8 decode anchors: a new T64 anchor and a retuned T128 anchor,
+  both with dual K1 residency (EP8 T64 -16 %, T128 -15 % on host .16).
 - Residency knobs (`k1_ctas_per_sm`, `k2_launch_factor`, `k1_stages`),
   optional weight L2 prefetch, the scalar-scale SM120 MMA emitted as direct
   PTX, the word-wide FP4 fragment shift, heuristic fixes and cheaper
