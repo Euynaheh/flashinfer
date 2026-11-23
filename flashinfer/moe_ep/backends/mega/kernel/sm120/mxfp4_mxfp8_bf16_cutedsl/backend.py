@@ -9,7 +9,7 @@ import torch
 from ......config import BootstrapConfig, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
-from ......core.runtime import sm120_mxfp8_cutedsl_runtime_requirements
+from ......core.runtime import sm120_w4a8_cutedsl_runtime_requirements
 from ......core.validation.common import (
     validate_mega_arch_sm120,
     validate_mega_fleet_params,
@@ -57,7 +57,7 @@ class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         return "sm120_mxfp4_mxfp8_bf16_cutedsl"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
-        return sm120_mxfp8_cutedsl_runtime_requirements(bootstrap)
+        return sm120_w4a8_cutedsl_runtime_requirements(bootstrap)
 
     def validate_init(
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams

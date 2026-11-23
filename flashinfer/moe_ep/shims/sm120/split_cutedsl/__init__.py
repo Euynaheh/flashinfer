@@ -5,14 +5,17 @@ from flashinfer.moe_ep.shims.sm120.split_cutedsl._paths import bootstrap_paths
 bootstrap_paths()
 
 from flashinfer.moe_ep.shims.sm120.split_cutedsl.runtime import (
+    COMM_BACKENDS,
     DECODE_GRAPH_COMPILE_BUCKETS,
     MegaMoESm120W4A8Config,
     MegaMoESm120W4A8Inputs,
     MegaMoESm120W4A8Workspace,
     allocate_workspace,
     run_split_mega_moe,
+    select_comm_backend,
     select_graph_compile_bucket,
     set_compile_tokens_per_rank,
+    workspace_compile_buckets,
 )
 from flashinfer.moe_ep.shims.sm120.split_cutedsl.staging import (
     ACTIVATION_DTYPE,
@@ -27,6 +30,7 @@ from flashinfer.moe_ep.shims.sm120.split_cutedsl.weights import (
 
 
 __all__ = [
+    "COMM_BACKENDS",
     "DECODE_GRAPH_COMPILE_BUCKETS",
     "ACTIVATION_DTYPE",
     "FP4_DTYPE",
@@ -38,8 +42,10 @@ __all__ = [
     "allocate_workspace",
     "bootstrap_paths",
     "run_split_mega_moe",
+    "select_comm_backend",
     "select_graph_compile_bucket",
     "set_compile_tokens_per_rank",
     "stage_inputs",
     "transform_prequantized_weights",
+    "workspace_compile_buckets",
 ]

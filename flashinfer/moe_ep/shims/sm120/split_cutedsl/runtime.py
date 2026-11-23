@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import time
 import warnings
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import torch
 
 from flashinfer.moe_ep.shims.sm120.split_cutedsl.comm import (
+    _no_dist,
+    close_session,
     compute_peer_offsets,
+    create_session,
     ensure_not_capturing,
-    free_sym_tensor,
+    page_bytes,
     sym_byte_view,
     sym_zeros,
 )
@@ -42,6 +47,92 @@ DECODE_GRAPH_COMPILE_BUCKETS = (
     4096,
 )
 _WARNED_DECODE_CAPACITY_FALLBACKS: set[int] = set()
+
+COMM_BACKENDS = ("p2p_direct", "p2p_split")
+
+
+def workspace_compile_buckets(workspace_capacity: int) -> tuple[int, ...]:
+    """Every compile bucket a workspace of this capacity can select."""
+
+    return tuple(
+        sorted(
+            {
+                workspace_capacity,
+                *(b for b in DECODE_GRAPH_COMPILE_BUCKETS if b <= workspace_capacity),
+            }
+        )
+    )
+
+
+def local_ep_topology(world_size: int) -> Any:
+    """Topology of a single-process EP world (no peers)."""
+
+    return SimpleNamespace(
+        peers=(),
+        same_numa_peer_count=world_size - 1,
+        cross_numa_peer_count=0,
+        force_ibgda_peer_mask=0,
+    )
+
+
+def discover_ep_topology(rank: int, world_size: int, control_group: Any) -> Any:
+    """Gather every EP rank's PCI/NUMA identity (collective for EP > 1)."""
+
+    if _no_dist() or world_size == 1:
+        return local_ep_topology(world_size)
+    from moe_sm120_mxfp4mxfp8_split.runtime.gpu_topology import (
+        discover_gpu_topology,
+        gather_ep_transport_topology,
+    )
+
+    topology = gather_ep_transport_topology(
+        discover_gpu_topology(torch.cuda.current_device(), rank),
+        ep_rank=rank,
+        ep_control_group=control_group,
+    )
+    if len(topology.peers) != world_size:
+        raise RuntimeError(
+            f"EP topology has {len(topology.peers)} ranks, expected {world_size}"
+        )
+    return topology
+
+
+def select_comm_backend(config: "MegaMoESm120W4A8Config", topology: Any) -> str:
+    """Transport for an EP world: ``p2p_direct`` or ``p2p_split``.
+
+    Same-NUMA worlds use direct P2P (NCCL LSA). A world spanning NUMA nodes
+    has no P2P mapping between them, so it uses ``p2p_split``: same-NUMA peers
+    stay direct and every cross-NUMA peer is served through a local shadow
+    segment synchronized over NCCL GIN. The optional ``comm_backend`` knob may
+    only confirm the backend that the discovered topology admits.
+    """
+
+    requested = (config.knobs or {}).get("comm_backend")
+    if requested is not None and requested not in COMM_BACKENDS:
+        raise ValueError(
+            f"unsupported SM120 W4A8 comm_backend {requested!r}; "
+            f"expected one of {COMM_BACKENDS}"
+        )
+    if not topology.cross_numa_peer_count:
+        if requested == "p2p_split":
+            raise ValueError("p2p_split needs cross-NUMA EP peers")
+        return "p2p_direct"
+    if requested == "p2p_direct":
+        raise ValueError(
+            "this EP world spans NUMA nodes without P2P between them; "
+            "use comm_backend='p2p_split' (the default for this topology)"
+        )
+    from moe_sm120_mxfp4mxfp8_split.transport.nccl.shadow import ShadowLayout
+    from moe_sm120_mxfp4mxfp8_split.tuned_table import SPLIT_MAX_EXPERTS_PER_RANK
+
+    if config.local_experts > SPLIT_MAX_EXPERTS_PER_RANK:
+        raise ValueError(
+            "p2p_split supports at most "
+            f"{SPLIT_MAX_EXPERTS_PER_RANK} experts per rank, got "
+            f"{config.local_experts}"
+        )
+    ShadowLayout.from_topology(topology, config.rank)
+    return "p2p_split"
 
 
 def select_graph_compile_bucket(
@@ -143,6 +234,7 @@ class _ExecutionStorage:
     rank_combine_ready: torch.Tensor | None
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     green_trace: torch.Tensor | None = None
+    xnuma: Any = None
 
 
 @dataclass
@@ -155,6 +247,7 @@ class _ExecutionBuffers:
     rank_combine_ready: torch.Tensor | None
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     green_trace: torch.Tensor | None = None
+    xnuma: Any = None
 
 
 @dataclass
@@ -184,6 +277,19 @@ class MegaMoESm120W4A8Workspace:
     output: torch.Tensor
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _control_group: Any = None
+    # NCCL symmetric-memory session (None for single-rank workspaces) and
+    # the EP transport derived from the discovered PCI/NUMA topology.
+    _comm_session: Any = None
+    _topology: Any = None
+    _comm_backend: str = "p2p_direct"
+    # bucket -> (combine_output, shared_workspace, rank_combine_ready),
+    # suballocated from the session arena in one collective order.
+    _symmetric_buffers: dict[int, tuple[Any, Any, Any]] = field(default_factory=dict)
+    # p2p_split: control-region layout and device epoch shared by every
+    # bucket's cross-NUMA transport.
+    _xnuma_region: Any = None
+    _xnuma_epoch: Any = None
+    _capture_streams: Any = None
     _storages: dict[int, _ExecutionStorage] = field(default_factory=dict)
     _execution_plans: dict[int, tuple[Any, Any]] = field(default_factory=dict)
     _compiled_k12: dict[int, tuple[Any, Any]] = field(default_factory=dict)
@@ -216,14 +322,23 @@ class MegaMoESm120W4A8Workspace:
         self._compiled_k12.clear()
         self._execution_plans.clear()
         self._storages.clear()
-        for root in reversed(self._sym_roots):
-            free_sym_tensor(root)
+        self._symmetric_buffers.clear()
         self._sym_roots.clear()
+        # Suballocations share one arena. Closing the session deregisters it
+        # and destroys the EP communicator; PyTorch storage ownership controls
+        # the final deallocation.
+        close_session(self._comm_session)
         self._destroyed = True
 
 
 class MegaMoESm120W4A8Frontend:
-    """Lazy JIT + native Green Context graph session for direct-P2P EP."""
+    """Lazy JIT + native Green Context graph session for one layer and bucket.
+
+    ``p2p_direct`` EP worlds reach every peer through NCCL LSA. ``p2p_split``
+    EP worlds (NUMA-split, e.g. EP8 on 2 x 4 GPUs) run the same kernels with
+    cross-NUMA peers mapped to local shadow segments that the cross-NUMA
+    transport keeps in sync over NCCL GIN.
+    """
 
     _LOCAL_RESET_REGIONS = (
         "l1_arrival_count",
@@ -291,7 +406,11 @@ class MegaMoESm120W4A8Frontend:
         if dist.is_available() and dist.is_initialized():
             dist.barrier(group=self.control_group)
 
-    def _heuristic_overrides(self):
+    @property
+    def _p2p_split(self) -> bool:
+        return getattr(self.workspace, "_comm_backend", "p2p_direct") == "p2p_split"
+
+    def _heuristic_overrides(self, *, split_compatible: bool = False):
         from moe_sm120_mxfp4mxfp8_split.heuristic import MegaMoEHeuristicOverrides
 
         fields = {field.name for field in dataclasses.fields(MegaMoEHeuristicOverrides)}
@@ -299,12 +418,26 @@ class MegaMoESm120W4A8Frontend:
         unknown = sorted(set(values) - fields)
         if unknown:
             raise ValueError(f"unknown SM120 W4A8 tuning knobs: {unknown}")
-        if values.get("comm_backend", "p2p_direct") != "p2p_direct":
-            raise NotImplementedError(
-                "the initial FlashInfer W4A8 backend supports p2p_direct only"
-            )
+        requested = values.get("comm_backend")
+        if requested is not None and requested not in COMM_BACKENDS:
+            raise ValueError(f"unsupported SM120 W4A8 comm_backend {requested!r}")
+        # Both transports run the p2p_direct kernels; p2p_split folds the
+        # cross-NUMA peers into one P2P group of shadow segments.
         values["comm_backend"] = "p2p_direct"
+        if split_compatible:
+            # The cross-NUMA forwarder tracks the 8-warp K2's per-expert
+            # progress and scatters into the per-slot combine output.
+            if values.get("rank_local_combine") or values.get("k2_warps") == 12:
+                raise ValueError(
+                    "p2p_split requires rank_local_combine=False and k2_warps=8"
+                )
+            values["rank_local_combine"] = False
+            values["k2_warps"] = 8
         return MegaMoEHeuristicOverrides(**values)
+
+    @staticmethod
+    def _split_compatible(spec) -> bool:
+        return not spec.kernel.rank_local_combine and spec.kernel.k2_warps == 8
 
     def _select_spec(self, tokens_per_rank: int):
         from moe_sm120_mxfp4mxfp8_split.api import (
@@ -318,6 +451,15 @@ class MegaMoESm120W4A8Frontend:
         )
 
         cfg = self.config
+        topology = getattr(self.workspace, "_topology", None) or local_ep_topology(
+            cfg.world_size
+        )
+        same_numa = topology.same_numa_peer_count
+        cross_numa = topology.cross_numa_peer_count
+        p2p_split = self._p2p_split
+        if p2p_split:
+            # Same folded view as the standalone runner: one P2P group.
+            same_numa, cross_numa = same_numa + cross_numa, 0
         jit = None
         if (
             os.environ.get("MEGA_SPLIT_GLOBALTIMER") == "1"
@@ -339,16 +481,23 @@ class MegaMoESm120W4A8Frontend:
             tensor_parallel_size=cfg.tensor_parallel_size,
             gate_up_clamp=cfg.gate_up_clamp,
         )
-        spec = select_compile_spec(
-            problem=problem,
-            ep_same_numa_peer_count=cfg.world_size - 1,
-            ep_cross_numa_peer_count=0,
-            num_sms=num_sms,
-            sm_min_partition=minimum,
-            sm_partition_alignment=alignment,
-            overrides=self._heuristic_overrides(),
-            jit=jit,
-        )
+
+        def select(split_compatible: bool):
+            return select_compile_spec(
+                problem=problem,
+                ep_same_numa_peer_count=same_numa,
+                ep_cross_numa_peer_count=cross_numa,
+                num_sms=num_sms,
+                sm_min_partition=minimum,
+                sm_partition_alignment=alignment,
+                overrides=self._heuristic_overrides(split_compatible=split_compatible),
+                jit=jit,
+                ep_numa_split=p2p_split,
+            )
+
+        spec = select(False)
+        if p2p_split and not self._split_compatible(spec):
+            spec = select(True)
         actual_k1, actual_k2 = query_green_context_sm_counts(
             k1_sm_count=spec.kernel.k1_sms
         )
@@ -358,12 +507,14 @@ class MegaMoESm120W4A8Frontend:
                 f"actual={(actual_k1, actual_k2)}, "
                 f"expected={(spec.kernel.k1_sms, spec.kernel.k2_sms)}"
             )
+        # Residency knobs multiply the launch grids on unchanged physical
+        # Green partitions (two K1 CTAs per K1 SM; two K2 CTAs per K2 SM).
         return dataclasses.replace(
             spec,
             build=SplitKernelBuildOptions(
                 concurrent_k1_k2=True,
-                k1_active_clusters=actual_k1,
-                k2_active_clusters=actual_k2,
+                k1_active_clusters=actual_k1 * spec.kernel.k1_ctas_per_sm,
+                k2_active_clusters=actual_k2 * spec.kernel.k2_launch_factor,
             ),
         )
 
@@ -380,7 +531,11 @@ class MegaMoESm120W4A8Frontend:
     ) -> dict[str, Any]:
         from src.sym_buffer import SymBufferHost
 
-        base, offsets = compute_peer_offsets(shared_workspace, self.config.world_size)
+        base, offsets = compute_peer_offsets(
+            shared_workspace,
+            self.config.world_size,
+            getattr(self.workspace, "_comm_session", None),
+        )
         fc1_alpha, fc2_alpha, fc1_norm_const = epilogue_args
         return dict(
             activation=self._to_cute(inputs.activation),
@@ -437,12 +592,91 @@ class MegaMoESm120W4A8Frontend:
                 f"rank_cache={kernel.dispatch_rank_cache} "
                 f"rank_combine={kernel.rank_local_combine} "
                 f"dispatch_warps={spec.jit.dispatch_warp_count} "
+                f"k1_ctas_per_sm={kernel.k1_ctas_per_sm} "
+                f"k2_launch_factor={kernel.k2_launch_factor} "
+                f"backend={'p2p_split' if self._p2p_split else kernel.comm_backend} "
                 f"green={kernel.k1_sms}/{kernel.k2_sms}",
                 flush=True,
             )
-        plan = (spec, build_split_kernels(spec))
+        bundle = build_split_kernels(spec)
+        if self._p2p_split:
+            from moe_sm120_mxfp4mxfp8_split.kernel_fc2_combine import (
+                Sm120Fc2CombineKernel,
+            )
+
+            if type(bundle.k2) is not Sm120Fc2CombineKernel:
+                raise RuntimeError(
+                    "p2p_split needs the 8-warp K2 (Sm120Fc2CombineKernel); "
+                    f"bucket {bucket} selected {type(bundle.k2).__name__}"
+                )
+            # Peer-store barriers wait only for same-NUMA ranks; cross-NUMA
+            # sources are delivered by the cross-NUMA transport.
+            same_numa_mask = ((1 << self.config.world_size) - 1) & ~int(
+                self.workspace._topology.force_ibgda_peer_mask
+            )
+            for kernel in (
+                bundle.k1,
+                bundle.k2,
+                bundle.k2_drain,
+                bundle.k2_finalizer,
+            ):
+                if (
+                    kernel is not None
+                    and getattr(kernel, "token_comm", None) is not None
+                ):
+                    kernel.token_comm.barrier_peer_mask = same_numa_mask
+        plan = (spec, bundle)
         self.workspace._execution_plans[bucket] = plan
         return plan
+
+    def _create_xnuma(self, bundle, combine_output: torch.Tensor):
+        """Cross-NUMA transport of this bucket (shared by its layers)."""
+
+        from moe_sm120_mxfp4mxfp8_split.transport.xnuma import XnumaTransport
+        from moe_sm120_mxfp4mxfp8_split.transport.xnuma_layout import XnumaLayout
+
+        workspace, cfg, bucket = self.workspace, self.config, self.compile_bucket
+        region = workspace._xnuma_region
+        layout = XnumaLayout(
+            world=cfg.world_size,
+            n_cross=region.n_cross,
+            experts_per_rank=cfg.local_experts,
+            tokens_per_rank=bucket,
+            topk=cfg.num_topk,
+            hidden=cfg.hidden,
+        )
+        inputs = (
+            workspace.x[:bucket],
+            workspace.x_scale[:bucket],
+            workspace.topk_ids[:bucket],
+            workspace.topk_weights[:bucket],
+        )
+        view = SimpleNamespace(
+            rank=cfg.rank,
+            _kernel_k2=bundle.k2,
+            my_activation=inputs[0],
+            my_activation_sf=inputs[1],
+            my_topk_idx=inputs[2],
+            my_topk_weights=inputs[3],
+            combine_output=combine_output,
+        )
+        # The session zeroed the control region once at creation; signal and
+        # commit words are cumulative across buckets and must not be cleared.
+        transport = XnumaTransport(
+            view,
+            workspace._comm_session,
+            layout,
+            region=region,
+            epoch=workspace._xnuma_epoch,
+            input_regions=inputs,
+            zero_reserved=False,
+        )
+        # Compile-time hooks; set before K1/K2 are compiled for this bucket.
+        bundle.k1.token_comm.xnuma = transport.k1_config()
+        for kernel in (bundle.k2, bundle.k2_drain):
+            if kernel is not None:
+                kernel.xnuma_progress_addr = transport.k2_progress_addr
+        return transport
 
     def _ensure_execution(self) -> _ExecutionBuffers:
         execution = self.workspace._executions.get(self.compile_bucket)
@@ -458,24 +692,21 @@ class MegaMoESm120W4A8Frontend:
                 dtype=torch.uint8,
                 device="cuda",
             )
-            shared_workspace = sym_zeros((bundle.shared_workspace_bytes,), torch.uint8)
-            self.workspace._sym_roots.append(shared_workspace)
-            combine_output, root = sym_byte_view(
-                (
-                    self.compile_bucket,
-                    self.config.num_topk,
-                    self.config.hidden,
-                ),
-                torch.bfloat16,
-            )
-            self.workspace._sym_roots.append(root)
-            rank_combine_ready = None
-            if spec.kernel.rank_local_combine:
-                rank_combine_ready = sym_zeros(
-                    (self.compile_bucket + 1, self.config.world_size),
-                    torch.int32,
+            symmetric = self.workspace._symmetric_buffers.get(self.compile_bucket)
+            if symmetric is None:
+                if getattr(self.workspace, "_comm_session", None) is not None:
+                    raise RuntimeError(
+                        f"W4A8 bucket {self.compile_bucket} was not planned at "
+                        "workspace allocation"
+                    )
+                symmetric = _allocate_bucket_buffers(
+                    self.config, self.compile_bucket, spec, bundle, session=None
                 )
-                self.workspace._sym_roots.append(rank_combine_ready)
+                self.workspace._symmetric_buffers[self.compile_bucket] = symmetric
+            combine_output, shared_workspace, rank_combine_ready = symmetric
+            xnuma = (
+                self._create_xnuma(bundle, combine_output) if self._p2p_split else None
+            )
             epilogue_args = tuple(
                 torch.ones(
                     (self.config.local_experts,),
@@ -507,11 +738,12 @@ class MegaMoESm120W4A8Frontend:
                 rank_combine_ready=rank_combine_ready,
                 epilogue_args=epilogue_args,
                 green_trace=green_trace,
+                xnuma=xnuma,
             )
             self.workspace._storages[self.compile_bucket] = storage
             if os.environ.get("FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC") == "1":
-                # Logical buffer bytes include NVSHMEM views; CUDA allocator
-                # counters alone do not account for their symmetric heap.
+                # Logical buffer bytes include NCCL arena views; CUDA allocator
+                # counters alone do not account for the symmetric arena.
                 storage_bytes = sum(
                     tensor.numel() * tensor.element_size()
                     for item in self.workspace._storages.values()
@@ -544,6 +776,7 @@ class MegaMoESm120W4A8Frontend:
             rank_combine_ready=storage.rank_combine_ready,
             epilogue_args=storage.epilogue_args,
             green_trace=storage.green_trace,
+            xnuma=storage.xnuma,
         )
         self.workspace._executions[self.compile_bucket] = execution
         return execution
@@ -574,9 +807,15 @@ class MegaMoESm120W4A8Frontend:
         epilogue_args = execution.epilogue_args
         green_trace = execution.green_trace
 
-        root_stream = torch.cuda.Stream(priority=0)
-        k1_stream = torch.cuda.Stream(priority=-1)
-        k2_stream = torch.cuda.Stream(priority=0)
+        # Layers sharing this workspace execute serially; reuse the capture
+        # streams instead of allocating three persistent streams per layer.
+        if self.workspace._capture_streams is None:
+            self.workspace._capture_streams = (
+                torch.cuda.Stream(priority=0),
+                torch.cuda.Stream(priority=-1),
+                torch.cuda.Stream(priority=0),
+            )
+        root_stream, k1_stream, k2_stream = self.workspace._capture_streams
         root_cuda = cuda.CUstream(root_stream.cuda_stream)
         k1_cuda = cuda.CUstream(k1_stream.cuda_stream)
         k2_cuda = cuda.CUstream(k2_stream.cuda_stream)
@@ -592,9 +831,15 @@ class MegaMoESm120W4A8Frontend:
         )
         runtime_k1 = dict(base_runtime, stream=k1_cuda)
         runtime_k2 = dict(base_runtime, stream=k2_cuda)
-        compile_k1 = dict(runtime_k1, max_active_clusters=spec.kernel.k1_sms)
+        # Residency knobs multiply the launch grids on unchanged physical
+        # Green partitions (k1_ctas_per_sm: two K1 CTAs per K1 SM;
+        # k2_launch_factor: two 8-warp K2 CTAs per K2 SM).
+        k1_launch_clusters = spec.kernel.k1_sms * spec.kernel.k1_ctas_per_sm
+        compile_k1 = dict(runtime_k1, max_active_clusters=k1_launch_clusters)
         k2_ctas_per_sm = 2 if spec.kernel.k2_warps == 12 else 1
-        k2_launch_clusters = spec.kernel.k2_sms * k2_ctas_per_sm
+        k2_launch_clusters = (
+            spec.kernel.k2_sms * k2_ctas_per_sm * spec.kernel.k2_launch_factor
+        )
         compile_k2 = dict(
             runtime_k2,
             max_active_clusters=k2_launch_clusters,
@@ -627,7 +872,7 @@ class MegaMoESm120W4A8Frontend:
                     max_active_clusters=k2_drain_launch_clusters,
                 ),
             )
-        k1_graph_grid_blocks = [spec.kernel.k1_sms]
+        k1_graph_grid_blocks = [k1_launch_clusters]
         if k2_drain_launch_clusters > 0:
             k1_graph_grid_blocks.append(k2_drain_launch_clusters)
 
@@ -672,6 +917,9 @@ class MegaMoESm120W4A8Frontend:
                 topk_score_cute=score_cute,
                 stream=k3_stream,
             )
+        if bundle.k2_finalizer is not None:
+            # The one-CTA finalizer runs after both worker streams retire.
+            k1_graph_grid_blocks.append(1)
 
         k1_executor = compiled_k1.to(None)
         k2_executor = compiled_k2.to(None)
@@ -690,6 +938,15 @@ class MegaMoESm120W4A8Frontend:
             k2_executor=k2_executor,
             k2_drain_executor=drain_executor,
             k3_executor=k3_executor,
+            compiled_kernels=tuple(
+                k
+                for k in (compiled_k1, compiled_k2, compiled_drain, compiled_k3)
+                if k is not None
+            ),
+            compiled_role_owners={
+                0: (compiled_k1, compiled_drain),
+                1: (compiled_k2,),
+            },
             launch_k1=lambda: k1_executor(**runtime_k1),
             launch_k2=lambda: k2_executor(**runtime_k2),
             launch_k2_drain=(
@@ -703,7 +960,14 @@ class MegaMoESm120W4A8Frontend:
                 if finalizer_executor is not None
                 else None
             ),
-            launch_k3=lambda: k3_executor(**runtime_k3),
+            # Non-streaming K3 runs after the graph, on the root stream for
+            # eager replay or the caller stream under an outer capture.
+            launch_k3=lambda: k3_executor(
+                **dict(
+                    runtime_k3,
+                    stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+                )
+            ),
             launch_reset=(
                 (
                     lambda: self._reset_execution(
@@ -717,6 +981,7 @@ class MegaMoESm120W4A8Frontend:
             k1_sm_count=spec.kernel.k1_sms,
             k1_grid_blocks=tuple(k1_graph_grid_blocks),
             k2_grid_blocks=k2_launch_clusters,
+            xnuma=execution.xnuma,
         )
         graph_captured = time.monotonic()
         if os.environ.get("FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC") == "1":
@@ -821,44 +1086,148 @@ def set_compile_tokens_per_rank(
     )
 
 
+def _input_shapes(config: MegaMoESm120W4A8Config) -> tuple:
+    """(shape, dtype) of the staged inputs and output, in arena order."""
+
+    capacity = config.max_tokens_per_rank
+    scale_columns = round_up(ceil_div(config.hidden, 32), 4)
+    return (
+        ((capacity, config.hidden), ACTIVATION_DTYPE),
+        ((capacity, scale_columns), SCALE_DTYPE),
+        ((capacity, config.num_topk), torch.int64),
+        ((capacity, config.num_topk), torch.float32),
+        ((capacity, config.hidden), torch.bfloat16),
+    )
+
+
+def _bucket_buffer_bytes(config: MegaMoESm120W4A8Config, bucket: int, spec, bundle):
+    sizes = [
+        bucket * config.num_topk * config.hidden * 2,
+        bundle.shared_workspace_bytes,
+    ]
+    if spec.kernel.rank_local_combine:
+        sizes.append((bucket + 1) * config.world_size * 4)
+    return sizes
+
+
+def _allocate_bucket_buffers(
+    config: MegaMoESm120W4A8Config, bucket: int, spec, bundle, *, session
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Peer-visible buffers of one compile bucket, in the planned order."""
+
+    combine_output, _root = sym_byte_view(
+        (bucket, config.num_topk, config.hidden), torch.bfloat16, session=session
+    )
+    shared_workspace = sym_zeros(
+        (bundle.shared_workspace_bytes,), torch.uint8, session=session
+    )
+    rank_combine_ready = None
+    if spec.kernel.rank_local_combine:
+        rank_combine_ready = sym_zeros(
+            (bucket + 1, config.world_size), torch.int32, session=session
+        )
+    return combine_output, shared_workspace, rank_combine_ready
+
+
 def allocate_workspace(
     config: MegaMoESm120W4A8Config,
     *,
     control_group: Any = None,
 ) -> MegaMoESm120W4A8Workspace:
+    """Allocate the staged inputs and, for EP > 1, the NCCL symmetric arena.
+
+    Multi-rank workspaces discover the EP PCI/NUMA topology, select
+    ``p2p_direct`` or ``p2p_split``, and plan every compile bucket up front:
+    NCCL windows cannot grow after peers are mapped, and one peer-offset table
+    serves every suballocation only if all ranks allocate identical sizes in
+    the same order. Collective on every EP rank; not allowed during capture.
+    """
     config.validate()
-    roots: list[torch.Tensor] = []
-    x, root = sym_byte_view(
-        (config.max_tokens_per_rank, config.hidden), ACTIVATION_DTYPE
+    ensure_not_capturing("W4A8 workspace allocation")
+    multi_rank = config.world_size > 1 and not _no_dist()
+    topology = (
+        discover_ep_topology(config.rank, config.world_size, control_group)
+        if multi_rank
+        else local_ep_topology(config.world_size)
     )
-    roots.append(root)
-    scale_columns = round_up(ceil_div(config.hidden, 32), 4)
-    x_scale, root = sym_byte_view(
-        (config.max_tokens_per_rank, scale_columns), SCALE_DTYPE
-    )
-    roots.append(root)
-    topk_ids = sym_zeros((config.max_tokens_per_rank, config.num_topk), torch.int64)
-    topk_ids.fill_(-1)
-    roots.append(topk_ids)
-    topk_weights = sym_zeros(
-        (config.max_tokens_per_rank, config.num_topk), torch.float32
-    )
-    roots.append(topk_weights)
-    output, root = sym_byte_view(
-        (config.max_tokens_per_rank, config.hidden), torch.bfloat16
-    )
-    roots.append(root)
+    comm_backend = select_comm_backend(config, topology)
     workspace = MegaMoESm120W4A8Workspace(
         config=config,
-        x=x,
-        x_scale=x_scale,
-        topk_ids=topk_ids,
-        topk_weights=topk_weights,
-        output=output,
-        _sym_roots=roots,
+        x=None,
+        x_scale=None,
+        topk_ids=None,
+        topk_weights=None,
+        output=None,
         _control_group=control_group,
+        _topology=topology,
+        _comm_backend=comm_backend,
         _compile_bucket=config.max_tokens_per_rank,
     )
+    session = None
+    buckets = workspace_compile_buckets(config.max_tokens_per_rank)
+    plans = {}
+    if multi_rank:
+        sizes = [
+            math.prod(shape) * dtype.itemsize for shape, dtype in _input_shapes(config)
+        ]
+        for bucket in buckets:
+            frontend = MegaMoESm120W4A8Frontend(
+                workspace, compile_bucket=bucket, control_group=control_group
+            )
+            spec, bundle = frontend._ensure_plan(bucket)
+            plans[bucket] = (spec, bundle)
+            sizes += _bucket_buffer_bytes(config, bucket, spec, bundle)
+        shadow = None
+        reserved_bytes = 0
+        if comm_backend == "p2p_split":
+            from moe_sm120_mxfp4mxfp8_split.transport.nccl.shadow import ShadowLayout
+            from moe_sm120_mxfp4mxfp8_split.transport.xnuma_layout import XnumaLayout
+
+            shadow = ShadowLayout.from_topology(topology, config.rank)
+            # One control-region placement for every bucket: commit words are
+            # cumulative signal-adds keyed by address.
+            workspace._xnuma_region = XnumaLayout(
+                world=config.world_size,
+                n_cross=shadow.num_cross,
+                experts_per_rank=config.local_experts,
+                tokens_per_rank=max(buckets),
+                topk=config.num_topk,
+                hidden=config.hidden,
+            )
+            reserved_bytes = workspace._xnuma_region.reserved_bytes
+            workspace._xnuma_epoch = torch.zeros((1,), dtype=torch.int64, device="cuda")
+        session = create_session(
+            rank=config.rank,
+            world_size=config.world_size,
+            control_group=control_group,
+            topology=topology,
+            p2p_bytes=sum(page_bytes(n) for n in sizes),
+            shadow=shadow,
+            reserved_bytes=reserved_bytes,
+        )
+        workspace._comm_session = session
+    try:
+        roots: list[torch.Tensor] = []
+        views = []
+        for shape, dtype in _input_shapes(config):
+            view, root = sym_byte_view(shape, dtype, session=session)
+            views.append(view)
+            roots.append(root)
+        workspace.x, workspace.x_scale, workspace.topk_ids = views[:3]
+        workspace.topk_weights, workspace.output = views[3:]
+        workspace.topk_ids.fill_(-1)
+        for bucket, (spec, bundle) in plans.items():
+            workspace._symmetric_buffers[bucket] = _allocate_bucket_buffers(
+                config, bucket, spec, bundle, session=session
+            )
+        if session is not None:
+            # One offset table serves every suballocation only if all ranks
+            # allocated identical sizes in identical order.
+            session.verify_symmetric()
+        workspace._sym_roots = roots
+    except BaseException:
+        close_session(session)
+        raise
     return workspace
 
 
@@ -909,12 +1278,16 @@ def run_split_mega_moe(
 
 
 __all__ = [
+    "COMM_BACKENDS",
     "DECODE_GRAPH_COMPILE_BUCKETS",
     "MegaMoESm120W4A8Config",
     "MegaMoESm120W4A8Inputs",
     "MegaMoESm120W4A8Workspace",
     "allocate_workspace",
+    "discover_ep_topology",
     "run_split_mega_moe",
+    "select_comm_backend",
     "select_graph_compile_bucket",
     "set_compile_tokens_per_rank",
+    "workspace_compile_buckets",
 ]

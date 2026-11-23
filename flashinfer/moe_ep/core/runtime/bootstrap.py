@@ -389,6 +389,20 @@ def sm120_mxfp8_cutedsl_runtime_requirements(
     return nvfp4_cutedsl_runtime_requirements(bootstrap)
 
 
+def sm120_w4a8_cutedsl_runtime_requirements(
+    bootstrap: BootstrapConfig,
+) -> FrozenSet[str]:
+    """Runtime needs for the SM120 MXFP4 x MXFP8 split mega kernel.
+
+    Each workspace creates its own NCCL 2.30.7 symmetric-memory session from
+    the EP process group; NVSHMEM is not used.
+    """
+    del bootstrap
+    if _mega_no_dist():
+        return frozenset()
+    return frozenset({TORCH_DIST})
+
+
 __all__ = [
     "MoEEpRuntimeHandle",
     "NVSHMEM",
@@ -403,5 +417,6 @@ __all__ = [
     "sm90_pull_bf16_runtime_requirements",
     "sm90_pull_fp8_runtime_requirements",
     "sm120_mxfp8_cutedsl_runtime_requirements",
+    "sm120_w4a8_cutedsl_runtime_requirements",
     "split_comm_runtime_requirements",
 ]

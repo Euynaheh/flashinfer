@@ -15,6 +15,7 @@ from .bootstrap import (
     sm90_pull_bf16_runtime_requirements,
     sm90_pull_fp8_runtime_requirements,
     sm120_mxfp8_cutedsl_runtime_requirements,
+    sm120_w4a8_cutedsl_runtime_requirements,
     split_comm_runtime_requirements,
 )
 
@@ -33,5 +34,6 @@ __all__ = [
     "sm90_pull_bf16_runtime_requirements",
     "sm90_pull_fp8_runtime_requirements",
     "sm120_mxfp8_cutedsl_runtime_requirements",
+    "sm120_w4a8_cutedsl_runtime_requirements",
     "split_comm_runtime_requirements",
 ]
