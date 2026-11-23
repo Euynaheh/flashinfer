@@ -26,10 +26,11 @@ The current SM120 path is validated with:
 
 - public `nvidia-cutlass-dsl==4.6.0`;
 - CUDA Toolkit 13.3;
-- NVSHMEM library 3.7.0 and NVSHMEM4Py 0.3.1; and
+- NCCL 2.30.7 with the device API (LSA symmetric memory and GIN); and
 - Python 3.12 on RTX Pro 5000-class SM120 GPUs.
 
-The hybrid transport compatibility guard currently requires NVSHMEM 3.7.0.
+NVSHMEM is not used. P2P buffers live in NCCL symmetric windows, and
+cross-NUMA EP peers are reached through NCCL GIN.
 
 ## Launch Modes
 
@@ -145,7 +146,7 @@ The commands below use the DSV4-flash shape and 8192 input tokens per rank.
 They assume an eight-GPU host whose `CUDA_VISIBLE_DEVICES` order places GPUs
 0--3 on one NUMA node and GPUs 4--7 on the other. Every GPU pair within one
 NUMA node must support CUDA peer access (`cuDeviceCanAccessPeer == 1`) and a
-usable NVSHMEM peer mapping. Cross-NUMA pairs are expected to use IBGDA.
+usable NCCL LSA peer mapping. Cross-NUMA pairs use NCCL GIN.
 
 The runtime does not infer NUMA membership from ordinal ranges: it gathers
 each selected GPU's PCI BDF and `/sys/bus/pci/devices/<BDF>/numa_node`, then
@@ -207,5 +208,5 @@ commands above), so TP2 runs a 2048-wide shard on each GPU. TP currently support
 form-A K3 path; the in-kernel form-B top-k reduce is rejected until it has a
 TP-aware accumulation-order reference.
 
-The package-local process-group and NVSHMEM bootstrap lives in
+The package-local process-group and NCCL memory bootstrap lives in
 `runtime/parallelism.py`; public `src/` is unchanged.

@@ -22,11 +22,9 @@ from dataclasses import dataclass
 import os
 from typing import Optional, Tuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
 
-import nvshmem.core
 
 from .gpu_topology import (
     EpTransportTopology,
@@ -225,55 +223,39 @@ def init_parallel_context(
     )
 
 
-def init_nvshmem(context: ParallelContext) -> ParallelContext:
-    """Initialize the package-local EP NVSHMEM world after transport setup."""
+def init_nccl_memory(
+    context: ParallelContext,
+    p2p_bytes: int,
+    network: bool = False,
+    lsa_required_mask: Optional[int] = None,
+    shadow=None,
+    reserved_bytes: int = 0,
+) -> ParallelContext:
+    """Create the EP NCCL symmetric-memory session (LSA; GIN if ``network``).
 
-    uid = nvshmem.core.get_unique_id(empty=(context.ep_rank != 0))
-    uid_bytes = uid._data.view(np.uint8).copy()
-    uid_tensor = torch.from_numpy(uid_bytes).cuda()
-    dist.broadcast(
-        uid_tensor,
-        src=context.ep_global_ranks[0],
-        group=context.ep_group,
-    )
-    dist.barrier(group=context.ep_group)
-    uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
+    Every transport (P2P, GIN hybrid, GIN) runs on this session. Must run
+    after :func:`init_parallel_context` on every EP rank in the same order.
+    """
 
-    nvshmem.core.init(
-        device=context.device,
-        uid=uid,
-        rank=context.ep_rank,
-        nranks=context.ep_size,
-        initializer_method="uid",
+    from moe_sm120_mxfp4mxfp8_split.transport.nccl import session
+
+    nccl_session = session.initialize(
+        context, p2p_bytes, network, lsa_required_mask, shadow, reserved_bytes
     )
     print(
         "[DP/TP/EP bootstrap] "
         f"global_rank={context.global_rank}/{context.global_world_size} "
-        f"local_rank={context.local_rank} "
-        f"DP={context.data_parallel_rank}/{context.data_parallel_size} "
-        f"TP={context.tensor_parallel_rank}/{context.tensor_parallel_size} "
         f"EP={context.ep_rank}/{context.ep_size} "
-        f"ep_ranks={context.ep_global_ranks} "
-        f"tp_ranks={context.tp_global_ranks} nvshmem_world=ep",
+        f"memory=nccl{nccl_session.describe()['nccl_version']} "
+        f"network={'gin' if network else 'none'} "
+        f"p2p_arena={nccl_session.p2p.limit}",
         flush=True,
     )
     return context
 
 
-def init_parallel_and_nvshmem(
-    data_parallel_size: int,
-    tensor_parallel_size: int,
-) -> ParallelContext:
-    """Compatibility wrapper for callers that do not need transport setup."""
-
-    return init_nvshmem(
-        init_parallel_context(data_parallel_size, tensor_parallel_size)
-    )
-
-
 __all__ = [
     "ParallelContext",
-    "init_nvshmem",
+    "init_nccl_memory",
     "init_parallel_context",
-    "init_parallel_and_nvshmem",
 ]

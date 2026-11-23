@@ -49,6 +49,23 @@ from src.token_comm import CombineFormat, TokenInPullTokenBackPush, TokenSrcMeta
 class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
     """Specialize common token communication for the SM120 SYSMEM path."""
 
+    # Ranks whose arrival the dispatch barrier waits for (compile-time).
+    # p2p_split restricts it to the same-NUMA group; cross-NUMA sources
+    # publish through the xnuma transport instead of peer stores.
+    _barrier_peer_mask = None
+    # p2p_split: transport.xnuma.XnumaK1Config (compile-time constants) or None.
+    xnuma = None
+
+    @property
+    def barrier_peer_mask(self) -> int:
+        if self._barrier_peer_mask is None:
+            return (1 << self.world_size) - 1
+        return self._barrier_peer_mask
+
+    @barrier_peer_mask.setter
+    def barrier_peer_mask(self, mask: int) -> None:
+        self._barrier_peer_mask = int(mask)
+
     def __init__(
         self,
         *,
@@ -91,7 +108,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             scale_block=None,
         )
         kwargs["token_back_by_dispatch"] = fc2_output_dtype is not None
-        super().__init__(**kwargs)
+        # SM120 sizes the physical dispatch group itself; every warp participates
+        # in inherited dispatch_prep and the dispatch-to-scheduler rendezvous.
+        super().__init__(active_dispatch_warps=dispatch_warp_count, **kwargs)
         self.local_rank = local_rank
         self.max_tokens_per_rank = max_tokens_per_rank
         if comm_backend not in ("p2p_direct", "nvshmem_ibgda"):
@@ -242,6 +261,78 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             _iket.range_pop()
         cute.arch.fence_acq_rel_sys()
         cute.arch.fence_proxy("async.global")
+
+    @cute.jit
+    def xnuma_wait_unpack(self, expert_recv_count, src_token_topk_idx, warp_idx, lane_idx):
+        """p2p_split, K1 CTA 0, before the dispatch barrier: wait for every
+        cross-NUMA source's dispatch commit (value = epoch) and install its
+        record (per-expert counts + ``token * topk + slot`` lists) locally."""
+
+        x = self.xnuma
+        nthreads = self.num_dispatch_threads
+        bar_id = self.dispatch_intra_cta_bar_id
+        epoch = cute.arch.load(
+            cute.make_ptr(Int64, Int64(x.epoch_addr), AddressSpace.gmem, assumed_align=8),
+            Int64, sem="acquire", scope="gpu",
+        )
+        if warp_idx == Int32(0):
+            if lane_idx < Int32(len(x.cross_sources)):
+                sig = cute.make_ptr(
+                    Int64, Int64(x.dsig_addr) + Int64(lane_idx) * Int64(8),
+                    AddressSpace.gmem, assumed_align=8,
+                )
+                v = cute.arch.load(sig, Int64, sem="acquire", scope="sys")
+                while v < epoch:
+                    v = cute.arch.load(sig, Int64, sem="acquire", scope="sys")
+        cute.arch.barrier(barrier_id=bar_id, number_of_threads=nthreads)
+        tid = warp_idx * Int32(32) + lane_idx
+        for j in cutlass.range_constexpr(len(x.cross_sources)):
+            source = x.cross_sources[j]
+            rec = cute.make_tensor(
+                cute.make_ptr(Int32, Int64(x.inbox_addr + j * x.record_bytes), AddressSpace.gmem, assumed_align=4),
+                cute.make_layout(x.experts_per_rank * (1 + x.tokens_per_rank)),
+            )
+            e = tid
+            while e < Int32(x.experts_per_rank):
+                n = rec[e]
+                expert_recv_count[source, e] = Int64(n)
+                pos = Int32(0)
+                while pos < n:
+                    src_token_topk_idx[e, source, pos] = rec[
+                        Int32(x.experts_per_rank) + e * Int32(x.tokens_per_rank) + pos
+                    ]
+                    pos = pos + Int32(1)
+                e = e + Int32(nthreads)
+        cute.arch.fence_acq_rel_gpu()
+        cute.arch.barrier(barrier_id=bar_id, number_of_threads=nthreads)
+
+    @cute.jit
+    def xnuma_snapshot(self, expert_recv_count_sum, warp_idx, lane_idx):
+        """p2p_split, K1 CTA 0, after the dispatch barrier: publish this
+        epoch's per-expert totals for the forwarder, then the epoch flag."""
+
+        x = self.xnuma
+        nthreads = self.num_dispatch_threads
+        tid = warp_idx * Int32(32) + lane_idx
+        e = tid
+        while e < Int32(x.experts_per_rank):
+            v = expert_recv_count_sum[e]
+            cute.arch.store(
+                cute.make_ptr(Int32, Int64(x.k2tot_addr) + Int64(e) * Int64(4), AddressSpace.gmem, assumed_align=4),
+                Int32(v & Int64(0xFFFFFFFF)), sem="relaxed", scope="gpu",
+            )
+            e = e + Int32(nthreads)
+        cute.arch.fence_acq_rel_gpu()
+        cute.arch.barrier(barrier_id=self.dispatch_intra_cta_bar_id, number_of_threads=nthreads)
+        if tid == Int32(0):
+            epoch = cute.arch.load(
+                cute.make_ptr(Int64, Int64(x.epoch_addr), AddressSpace.gmem, assumed_align=8),
+                Int64, sem="relaxed", scope="gpu",
+            )
+            cute.arch.store(
+                cute.make_ptr(Int64, Int64(x.k2meta_addr), AddressSpace.gmem, assumed_align=8),
+                epoch, sem="release", scope="gpu",
+            )
 
     @cute.jit
     def dispatch_barrier(
@@ -1904,19 +1995,20 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     while ready == Int32(0):
                         all_ready = Int32(1)
                         for rank in cutlass.range_constexpr(0, self.world_size, 1):
-                            local_signal_ptr = (
-                                nvlink_barrier_signal.iterator
-                                + Int32(signal_slot_base * self.world_size)
-                                + signal_phase * Int32(self.world_size)
-                                + Int32(rank)
-                            )
-                            if cute.arch.load(
-                                local_signal_ptr,
-                                Int32,
-                                sem="acquire",
-                                scope="sys",
-                            ) < target:
-                                all_ready = Int32(0)
+                            if cutlass.const_expr((self.barrier_peer_mask >> rank) & 1 == 1):
+                                local_signal_ptr = (
+                                    nvlink_barrier_signal.iterator
+                                    + Int32(signal_slot_base * self.world_size)
+                                    + signal_phase * Int32(self.world_size)
+                                    + Int32(rank)
+                                )
+                                if cute.arch.load(
+                                    local_signal_ptr,
+                                    Int32,
+                                    sem="acquire",
+                                    scope="sys",
+                                ) < target:
+                                    all_ready = Int32(0)
                         if all_ready != Int32(0):
                             ready = Int32(1)
 
@@ -1960,29 +2052,23 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             # device-side NVSHMEM calls in the persistent compute kernel.
             pass
         else:
-            if cutlass.const_expr(self.rank_local_combine):
-                # The rank-local sideband is peer-written.  A fast rank may
-                # otherwise enter replay N+1 and publish its new counts while
-                # a slower peer is still completing that replay's local
-                # graph-ordered reset, which erases the fresh stores.  Join
-                # all ranks after their local reset and before the first peer
-                # write.  This is an epoch-entry ownership handoff, not a
-                # whole-dispatch admission barrier: dispatch_prep and FC1
-                # retain their ordinary fine-grained streaming protocol once
-                # the new epoch has begun.
-                self.nvlink_barrier(
-                    token_comm_args.nvlink_barrier_signal,
-                    token_comm_args.nvlink_barrier_counter,
-                    token_comm_args.grid_sync_counter,
-                    token_comm_args.peer_rank_ptr_mapper,
-                    cta_linear_id,
-                    local_warp_idx,
-                    lane_idx,
-                    slot=0,
-                    num_sms=token_comm_args.sm_count,
-                    prologue_grid_sync=True,
-                    epilogue_grid_sync=True,
-                )
+            # Receive counts are peer-written even when local combine is off.
+            # Join after every rank's reset, before publishing any new count;
+            # the later dispatch barrier cannot protect an earlier peer store.
+            # Keep fine-grained dispatch/FC1 streaming after this epoch handoff.
+            self.nvlink_barrier(
+                token_comm_args.nvlink_barrier_signal,
+                token_comm_args.nvlink_barrier_counter,
+                token_comm_args.grid_sync_counter,
+                token_comm_args.peer_rank_ptr_mapper,
+                cta_linear_id,
+                local_warp_idx,
+                lane_idx,
+                slot=0,
+                num_sms=token_comm_args.sm_count,
+                prologue_grid_sync=True,
+                epilogue_grid_sync=True,
+            )
 
             self.dispatch_prep(
                 token_comm_storage,
@@ -2079,6 +2165,15 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             _iket.range_pop()
             _iket.range_push("Dispatch_Barrier")
 
+        if cutlass.const_expr(self.xnuma is not None):
+            if cta_linear_id == Int32(0):
+                self.xnuma_wait_unpack(
+                    token_comm_args.expert_recv_count,
+                    token_comm_args.src_token_topk_idx,
+                    local_warp_idx,
+                    lane_idx,
+                )
+
         if cutlass.const_expr(self.comm_backend != "nvshmem_ibgda"):
             self.dispatch_barrier(
                 token_comm_args.expert_send_count,
@@ -2093,6 +2188,11 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 num_sms=token_comm_args.sm_count,
                 nvlink_barrier_counter=token_comm_args.nvlink_barrier_counter,
             )
+        if cutlass.const_expr(self.xnuma is not None):
+            if cta_linear_id == Int32(0):
+                self.xnuma_snapshot(
+                    token_comm_args.expert_recv_count_sum, local_warp_idx, lane_idx
+                )
 
         nb_dispatch_to_sched = pipeline.NamedBarrier(
             barrier_id=self.dispatch_to_sched_named_barrier_id,

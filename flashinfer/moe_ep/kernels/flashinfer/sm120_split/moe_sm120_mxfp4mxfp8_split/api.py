@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
+from functools import lru_cache, cached_property
 import json
 from typing import Any, Dict, Literal, Optional, Tuple
 
@@ -19,6 +20,7 @@ from .heuristic import (
     MegaMoEHeuristicOverrides,
     MegaMoEKernelConfig,
     select_megamoe_config,
+    select_config_and_dispatch,
 )
 from .jit_config import Sm120JitConfig
 
@@ -35,7 +37,14 @@ from .jit_config import Sm120JitConfig
 # loading the selected N64 scale tile into the packed compact fragment.
 # Revision 34 orders the raw compact-fragment load after its TMA/mbarrier
 # producer so cached v34 CUBINs cannot retain the weaker load semantics.
-KERNEL_CACHE_ABI = 35
+# Revision 36 integrates the upstream active-dispatch-warp transport contract.
+# ABI38: whole-warp LC specialization and workload-based midrange tuning.
+# ABI40: optional FC1 utility postprocessing, its shared handoff budget,
+# scheduler participation and bounded default selection. The utility flag is
+# included in the immutable kernel configuration and therefore the cache key.
+# ABI41: explicit joint FC1/FC2 weight TMA cache policy, including tail drain.
+# ABI42: widen FC2 workspace row indices after direct-stage mapping.
+KERNEL_CACHE_ABI = 43
 
 
 @dataclass(frozen=True)
@@ -156,7 +165,7 @@ class MegaMoECompileSpec:
             "build": asdict(self.build),
         }
 
-    @property
+    @cached_property
     def cache_key(self) -> str:
         payload = json.dumps(
             self.canonical_dict(),
@@ -201,6 +210,17 @@ def _select_dispatch_warp_count(
         or kernel.token_back_mode != "epi_warps"
     ):
         return 4
+    # Wide activation rows benefit from fewer dispatch participants even
+    # before the local-combine crossover. Preserve explicit JIT overrides.
+    if (
+        not kernel.rank_local_combine
+        and kernel.total_sms == 110
+        and problem.expert_parallel_size == 4
+        and problem.tensor_parallel_size == 1
+        and problem.hidden >= 6144
+        and 192.0 < kernel.expected_rows_per_expert <= 256.0
+    ):
+        return 1
     tuning_min_tokens = _rank_local_combine_tuning_min_tokens(
         problem.hidden, problem.intermediate, problem.num_topk,
         problem.num_total_experts,
@@ -229,12 +249,17 @@ def _resolve_jit_config(
 ) -> Sm120JitConfig:
     if jit.dispatch_warp_count is not None:
         return jit
+    if kernel.k1_ctas_per_sm == 2:
+        # Two resident K1 CTAs only fit half-SM shared memory with one
+        # dispatch warp.
+        return replace(jit, dispatch_warp_count=1)
     return replace(
         jit,
         dispatch_warp_count=_select_dispatch_warp_count(problem, kernel),
     )
 
 
+@lru_cache(maxsize=256)
 def select_compile_spec(
     *,
     problem: MegaMoEProblemSpec,
@@ -246,8 +271,14 @@ def select_compile_spec(
     overrides: Optional[MegaMoEHeuristicOverrides] = None,
     jit: Optional[Sm120JitConfig] = None,
     build: Optional[SplitKernelBuildOptions] = None,
+    use_tuned_defaults: bool = True,
+    ep_numa_split: bool = False,
 ) -> MegaMoECompileSpec:
-    """Resolve the production heuristic into a cacheable compile spec."""
+    """Resolve the production heuristic into a cacheable compile spec.
+
+    ``ep_numa_split`` selects the p2p_split view of a NUMA-split EP world:
+    callers fold the cross-NUMA peers into ``ep_same_numa_peer_count``.
+    """
 
     problem.validate()
     heuristic_input = MegaMoEHeuristicInput(
@@ -264,9 +295,25 @@ def select_compile_spec(
         num_sms=num_sms,
         sm_min_partition=sm_min_partition,
         sm_partition_alignment=sm_partition_alignment,
+        ep_numa_split=ep_numa_split,
     )
-    kernel = select_megamoe_config(heuristic_input, overrides)
-    jit_config = _resolve_jit_config(problem, kernel, jit or Sm120JitConfig())
+    kernel, dispatch = select_config_and_dispatch(heuristic_input, overrides,
+        use_tuned_defaults=use_tuned_defaults)
+    jit_config = jit or Sm120JitConfig()
+    if kernel.k1_ctas_per_sm == 2 and dispatch is not None:
+        dispatch = 1  # dual K1 residency needs one dispatch warp
+    if dispatch is not None and jit_config.dispatch_warp_count is None:
+        jit_config = replace(jit_config, dispatch_warp_count=dispatch)
+    jit_config = _resolve_jit_config(problem, kernel, jit_config)
+    # Automatic hints require the measured default code generation; explicit
+    # weight and activation overrides are independently honored.
+    reference_jit = _resolve_jit_config(
+        problem, kernel, Sm120JitConfig(dispatch_warp_count=dispatch))
+    if jit_config != reference_jit:
+        updates = {name: "default" for name in
+                   ("weight_eviction_policy", "activation_eviction_policy")
+                   if overrides is None or getattr(overrides, name) is None}
+        kernel = replace(kernel, **updates)
     return MegaMoECompileSpec(
         problem=problem,
         kernel=kernel,
@@ -372,6 +419,21 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         green_trace_role=0,
         **common_kwargs,
     )
+    # The flag is part of the immutable compile spec/cache key. Only K1
+    # consumes the extra descriptor and handoff barriers; K2 stays unchanged.
+    k1.fc1_utility_postprocess = config.fc1_utility_postprocess
+    if config.k1_ctas_per_sm == 2:
+        # Dual residency: natural register allocation (no warpgroup
+        # realloc) so two CTAs fit per SM; callers double the K1 grid.
+        k1.occupancy = 2
+        k1.use_warpgroup_reg_realloc = False
+        if config.k1_stages is None:
+            # Two stages where SMEM allows (validated decode default); larger
+            # K1 tiles at two CTAs/SM may only fit one.
+            k1.num_ab_stages_soft_cap = 2
+    if config.k1_stages is not None:
+        k1.num_ab_stages_override = config.k1_stages
+
     k2_load_balance = (
         "atomic_counter" if config.k2_tail_reclaim
         else options.load_balance_mode
@@ -441,6 +503,13 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         raise RuntimeError(
             f"K2 requested {expected_threads} threads, got {k2.threads_per_cta}"
         )
+    # All weight readers must use the same policy, including tail reclaim.
+    # The immutable kernel config participates in the compile/cache key.
+    for kernel in (k1, k2, k2_drain, k2_finalizer):
+        if kernel is not None:
+            kernel.weight_eviction_policy = config.weight_eviction_policy
+            kernel.activation_eviction_policy = config.activation_eviction_policy
+            kernel.weight_prefetch_ahead = config.weight_prefetch_ahead
     workspace_sizes = k1.get_workspace_sizes()
     peers = [k2]
     if k2_drain is not None:

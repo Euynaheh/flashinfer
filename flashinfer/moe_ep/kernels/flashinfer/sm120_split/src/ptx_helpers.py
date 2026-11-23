@@ -383,6 +383,22 @@ def red_add_release_sys_s32_raw(addr: Int64, val: Int32, *, loc=None, ip=None) -
 
 
 @dsl_user_op
+def red_add_relaxed_sys_f32(address, value: Float32, *, loc=None, ip=None) -> None:
+    """System-scope relaxed reduction add for a remote float32 destination."""
+    llvm.inline_asm(
+        None,
+        [address.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+        "red.relaxed.sys.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_add_relaxed_sys_v2_bf16x2(
     addr,
     val0_packed_bf16x2,
@@ -512,7 +528,7 @@ def _fence_rel_gpu(
     *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
 ) -> None:
     """
-    Fence operation with acquire-release semantics at system scope.
+    Fence operation with acquire-release semantics at device (gpu) scope.
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-membar>`__.
     """

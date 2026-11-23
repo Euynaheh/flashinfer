@@ -1,0 +1,800 @@
+{
+  "source_id": "61130e26616ccda8bf42eb4bf2441b70309c4f37f867326144868c7b4ede0566",
+  "schema": 1,
+  "kind": "local_workload_cost_interpolation",
+  "abi": 39,
+  "entries": [
+    {
+      "config": {
+        "k1": 32,
+        "k2": 16,
+        "stage": 2,
+        "sm": 88,
+        "bundle": 2,
+        "warps": 12,
+        "tail": true,
+        "cache": false,
+        "lc": false,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            0.5849625007211562,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 6.599881385313466
+        },
+        {
+          "features": [
+            2.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 6.77525652288758
+        },
+        {
+          "features": [
+            0.8300749985576875,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 6.694086692343466
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 32,
+        "k2": 16,
+        "stage": 2,
+        "sm": 72,
+        "bundle": 2,
+        "warps": 12,
+        "tail": true,
+        "cache": false,
+        "lc": false,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            0.5849625007211562,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 6.639195857301249
+        },
+        {
+          "features": [
+            2.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 6.800472893160443
+        },
+        {
+          "features": [
+            0.8300749985576875,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 6.7313807831671975
+        },
+        {
+          "features": [
+            2.8300749985576874,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 6.915120140522564
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 32,
+        "k2": 16,
+        "stage": 2,
+        "sm": 80,
+        "bundle": 1,
+        "warps": 12,
+        "tail": true,
+        "cache": false,
+        "lc": false,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            1.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 6.721560607880915
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 32,
+        "k2": 16,
+        "stage": 2,
+        "sm": 72,
+        "bundle": 1,
+        "warps": 12,
+        "tail": true,
+        "cache": false,
+        "lc": false,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            1.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 6.745857335203729
+        },
+        {
+          "features": [
+            1.8300749985576876,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 6.867566423074492
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 32,
+        "k2": 32,
+        "stage": 3,
+        "sm": 72,
+        "bundle": 4,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": false,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            3.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 6.8012207636466275
+        },
+        {
+          "features": [
+            3.8300749985576874,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 6.908778762841042
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 32,
+        "k2": 32,
+        "stage": 2,
+        "sm": 72,
+        "bundle": 4,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": false,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            3.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 6.927902950624608
+        },
+        {
+          "features": [
+            3.8300749985576874,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 7.060497002807905
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 64,
+        "k2": 64,
+        "stage": 3,
+        "sm": 64,
+        "bundle": 4,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": false,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            5.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 7.15228767393334
+        },
+        {
+          "features": [
+            5.830074998557688,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 7.297090972208256
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 128,
+        "k2": 128,
+        "stage": 3,
+        "sm": 72,
+        "bundle": 4,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": false,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            6.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 7.511030284629112
+        },
+        {
+          "features": [
+            6.830074998557688,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 7.7161293508621345
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 128,
+        "k2": 128,
+        "stage": 3,
+        "sm": 72,
+        "bundle": 8,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": false,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            7.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 8.184993411975242
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 128,
+        "k2": 128,
+        "stage": 3,
+        "sm": 72,
+        "bundle": 8,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": true,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            8.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 8.540215712730001
+        },
+        {
+          "features": [
+            8.830074998557688,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 8.92890647728591
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 128,
+        "k2": 128,
+        "stage": 3,
+        "sm": 72,
+        "bundle": 16,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": true,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            9.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 9.241904156606957
+        },
+        {
+          "features": [
+            10.169925001442312,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 9.643576307799774
+        },
+        {
+          "features": [
+            10.584962500721156,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 9.92861243505496
+        },
+        {
+          "features": [
+            10.906890595608518,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 10.151817830245765
+        },
+        {
+          "features": [
+            11.169925001442312,
+            0.0,
+            0.0,
+            0.8677144948935102,
+            0.0
+          ],
+          "log_us": 10.341143581272584
+        },
+        {
+          "features": [
+            10.415037499278844,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 9.943018950190114
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 32,
+        "k2": 16,
+        "stage": 2,
+        "sm": 88,
+        "bundle": 1,
+        "warps": 12,
+        "tail": true,
+        "cache": false,
+        "lc": false,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            1.8300749985576876,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 6.833617751657802
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 128,
+        "k2": 128,
+        "stage": 3,
+        "sm": 72,
+        "bundle": 4,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": true,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            7.830074998557688,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 8.235496360703495
+        },
+        {
+          "features": [
+            10.830074998557688,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 10.254274021434009
+        },
+        {
+          "features": [
+            11.15200309344505,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 10.437382015409542
+        },
+        {
+          "features": [
+            11.415037499278844,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 10.637725978474437
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 128,
+        "k2": 128,
+        "stage": 3,
+        "sm": 72,
+        "bundle": 8,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": false,
+        "dispatch": 4
+      },
+      "observations": [
+        {
+          "features": [
+            7.830074998557688,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 8.415495275159262
+        },
+        {
+          "features": [
+            8.830074998557688,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 9.091574891197777
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 128,
+        "k2": 128,
+        "stage": 2,
+        "sm": 72,
+        "bundle": 4,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": true,
+        "dispatch": 1
+      },
+      "observations": [
+        {
+          "features": [
+            9.830074998557688,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 9.62527304079546
+        }
+      ]
+    },
+    {
+      "config": {
+        "k1": 128,
+        "k2": 128,
+        "stage": 2,
+        "sm": 72,
+        "bundle": 16,
+        "warps": 8,
+        "tail": false,
+        "cache": true,
+        "lc": true,
+        "dispatch": 4
+      },
+      "observations": [
+        {
+          "features": [
+            9.830074998557688,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 9.682639362338515
+        },
+        {
+          "features": [
+            10.415037499278844,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 10.003772965295283
+        },
+        {
+          "features": [
+            10.830074998557688,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 10.312444127141529
+        },
+        {
+          "features": [
+            11.15200309344505,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 10.494795967976348
+        },
+        {
+          "features": [
+            11.415037499278844,
+            0.0,
+            0.0,
+            1.1521841069858125,
+            0.16992500144231237
+          ],
+          "log_us": 10.695099973653871
+        }
+      ]
+    }
+  ],
+  "numerical_contract": "owner_bf16",
+  "source": "calibration_only",
+  "scope": "same-NUMA EP4/TP1/110SM",
+  "note": "Bounded empirical policy, not a global optimum; no production adoption until holdouts pass",
+  "fc1_postprocess": {
+    "qualification": "w4a8_joint_adoption_20261112",
+    "ranges": [
+      {
+        "signature": [
+          4096,
+          4096,
+          6,
+          256
+        ],
+        "tokens": [
+          2,
+          512
+        ],
+        "utility": true
+      },
+      {
+        "signature": [
+          4096,
+          4096,
+          8,
+          288
+        ],
+        "tokens": [
+          2,
+          512
+        ],
+        "utility": true
+      },
+      {
+        "signature": [
+          4096,
+          4096,
+          8,
+          288
+        ],
+        "tokens": [
+          2048,
+          32768
+        ],
+        "utility": true,
+        "requires_rank_local_combine": true
+      }
+    ],
+    "abi": 40,
+    "n16_disposition": "explicit only: shape-only selection regresses under concentrated routing",
+    "baseline_commit": "acc40ede8ab0182eeaf04d36710422feb0f0783f",
+    "report": "docs/sm120_w4a8/fc1-joint-validation.md",
+    "boundary_qualification": "utility_bounds_ep4_20261113",
+    "boundary_report": "docs/sm120_w4a8/utility-boundaries.md"
+  },
+  "weight_cache": {
+    "abi": 43,
+    "qualification": "w4_cache_ranges_20261114",
+    "baseline_commit": "3ffe3ad8b1453004e21b79729c33b75e7db79cc9",
+    "report": "docs/sm120_w4a8/cache-interval-validation.md",
+    "selection": "Continuous intervals qualified using balanced and power-law routing only; concentrated routing is excluded from selection.",
+    "scope": "DP1/TP1, H4096/I4096, 110SM, partition 8/8, unchanged default kernel/JIT; EP4 same-NUMA or EP8 3 same-NUMA plus 4 cross-NUMA peers",
+    "ranges": [
+      {
+        "ep": 4,
+        "signature": [
+          4096,
+          4096,
+          6,
+          256
+        ],
+        "tokens": [
+          2,
+          127
+        ],
+        "activation": "default"
+      },
+      {
+        "ep": 4,
+        "signature": [
+          4096,
+          4096,
+          6,
+          256
+        ],
+        "tokens": [
+          128,
+          512
+        ],
+        "activation": "evict_last"
+      },
+      {
+        "ep": 4,
+        "signature": [
+          4096,
+          4096,
+          8,
+          288
+        ],
+        "tokens": [
+          1,
+          128
+        ],
+        "activation": "default"
+      },
+      {
+        "ep": 8,
+        "signature": [
+          4096,
+          4096,
+          6,
+          256
+        ],
+        "tokens": [
+          1,
+          128
+        ],
+        "activation": "evict_last"
+      },
+      {
+        "ep": 8,
+        "signature": [
+          4096,
+          4096,
+          8,
+          288
+        ],
+        "tokens": [
+          1,
+          64
+        ],
+        "activation": "evict_last"
+      }
+    ],
+    "decision": "Prefer continuous useful small-input intervals, with weight-only where activation-LAST adds no consistent benefit. Use joint hints where measured useful. Small balanced/power-law tradeoffs are documented; multi-percent repeated power-law regressions limit upper bounds."
+  }
+}

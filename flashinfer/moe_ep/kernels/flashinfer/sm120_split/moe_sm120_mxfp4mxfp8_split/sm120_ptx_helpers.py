@@ -9,16 +9,6 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Float32, Int32, Int64, T, dsl_user_op
 
 
-# Implemented by nvshmem_compat.cu and linked beside the validated NVSHMEM
-# device bitcode. Keeping the field access in a header-compiled translation
-# unit means an NVSHMEM layout change fails its static assertions instead of
-# silently changing an immediate offset in inline PTX.
-nvshmem_disable_p2p_peer = cute.ffi(
-    name="megamoe_nvshmem_disable_p2p_peer",
-    params_types=[cutlass.Int32],
-)
-
-
 @dsl_user_op
 def clamp_gate_upper_f32(
     value: Float32,
@@ -170,14 +160,14 @@ def spin_wait_i32_ge_cv_raw(
 
 @dsl_user_op
 def lds_b32_raw(addr, *, loc=None, ip=None) -> Int32:
-    """Load one shared-memory u32 through a raw shared address."""
+    """Read current shared storage; declare compiler memory effects."""
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [addr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
             "ld.shared.u32 $0, [$1];",
-            "=r,r",
-            has_side_effects=False,
+            "=r,r,~{memory}",
+            has_side_effects=True,
             asm_dialect=0,
             loc=loc,
             ip=ip,
@@ -187,13 +177,13 @@ def lds_b32_raw(addr, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def lds_b32_raw_ordered(addr, *, loc=None, ip=None) -> Int32:
-    """Load TMA-produced shared memory without compiler reordering."""
+    """Compatibility alias semantics: memory clobber plus side effects."""
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [addr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
             "ld.shared.u32 $0, [$1];",
-            "=r,r",
+            "=r,r,~{memory}",
             has_side_effects=True,
             asm_dialect=0,
             loc=loc,
@@ -221,6 +211,33 @@ def red_add_relaxed_sys_v2_bf16x2_raw(
         ],
         "red.relaxed.sys.global.add.noftz.v2.bf16x2 [$0], {$1, $2};",
         "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def utility_load_f32x4(ptr, *, loc=None, ip=None):
+    """Ordered, vector shared-memory handoff read after the full mbarrier."""
+    value = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 4), [ptr.toint().ir_value()],
+        'ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];',
+        '=f,=f,=f,=f,r,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return tuple(Float32(llvm.extractvalue(T.f32(), value, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def prefetch_global_l2(addr: Int64, *, loc=None, ip=None) -> None:
+    """Read-only L2 prefetch hint (never a substitute for data readiness)."""
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(loc=loc, ip=ip)],
+        "prefetch.global.L2 [$0];",
+        "l",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

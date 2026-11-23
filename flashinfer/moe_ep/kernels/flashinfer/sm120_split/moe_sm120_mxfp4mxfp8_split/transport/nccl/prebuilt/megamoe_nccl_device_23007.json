@@ -1,0 +1,12 @@
+{
+ "nccl_version": 23007,
+ "nccl_header_version": 23007,
+ "sources": {
+  "megamoe_nccl_device.cu": "1675cd732759eb4b0dc0f0aa802e177ab54923000a76c54a060ebbfe2f80ce4d",
+  "megamoe_nccl_state.h": "7765c837288b0d81dbc2ded375d528b73f8c63e33fc9b930039fd64f48b90144"
+ },
+ "nccl_device_h_sha256": "1afc5de19ef2b62109e8b700dc8d73c2f446d62b2824c24b20300998890da6b1",
+ "bitcode_sha256": "aa14ea7d4641cbeedbe8f7d71dd0012d606af23f4115c8e840467e17546660be",
+ "compiler": "Ubuntu clang version 18.1.3 (1ubuntu1)",
+ "cuda_headers": "pinned wheels: nvidia-cuda-runtime-cu12 12.8.90, nvidia-cuda-nvcc-cu12 12.8.93, nvidia-cuda-cccl-cu12 12.8.90 (+curand from local toolkit)"
+}

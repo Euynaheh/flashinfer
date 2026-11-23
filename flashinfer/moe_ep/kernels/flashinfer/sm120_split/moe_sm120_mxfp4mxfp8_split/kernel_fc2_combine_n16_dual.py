@@ -10,6 +10,7 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
+from .sm120_ptx_helpers import prefetch_global_l2
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- wheels without cute.iket
@@ -40,6 +41,8 @@ from .split_timestamp import (
     FIELD_FIRST_TILE_ID,
     FIELD_FIRST_WORK,
     FIELD_KERNEL_ENTRY,
+    FIELD_SMID,
+    read_smid,
     FIELD_KERNEL_EXIT,
     FIELD_LAST_TILE_ID,
     FIELD_LAST_WORK,
@@ -118,6 +121,7 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoEMxfp8SwapABKernel):
             * (self.mma_tiler[0] // 16)
         )
         ext = Sm120SwapABMxfp8Fc12SchedExtension(sf_vec_size=self.sf_vec_size, fc1_done_counter_ptr=fc1_done_counter.iterator, fc2_spin_threshold=ext_fc2_spin_threshold, fc1_ready_counter_ptr=self.token_comm_hook_fc1_ready_counter_ptr(token_comm_args))
+        lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         use_2cta_instrs = False
@@ -130,6 +134,7 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoEMxfp8SwapABKernel):
         if cutlass.const_expr(green_trace is not None):
             if warp_idx == cutlass.Int32(0):
                 if cute.arch.lane_idx() == cutlass.Int32(0):
+                    cute.arch.store(green_trace.iterator + trace_word(trace_role, cta_linear_id, FIELD_SMID), cutlass.Int64(read_smid()), scope='gpu')
                     cute.arch.store(green_trace.iterator + trace_word(trace_role, cta_linear_id, FIELD_KERNEL_ENTRY), read_globaltimer(), scope='gpu')
         mma_tile_coord_v = cutlass.Int32(0)
         is_leader_cta = True
@@ -398,6 +403,18 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoEMxfp8SwapABKernel):
                 a_producer.reset()
                 peek_ab_empty_status = a_producer.try_acquire()
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    # Optional weight L2 prefetch: two 128 B lines per lane, `ahead` K tiles
+                    # ahead, every second tile (compiled out when weight_prefetch_ahead=0).
+                    if cutlass.const_expr(getattr(self, "weight_prefetch_ahead", 0) > 0):
+                        if (k_tile % 2 == 0) and (k_tile + getattr(self, "weight_prefetch_ahead", 0) < k_tile_cnt):
+                            for prefetch_half in cutlass.range_constexpr(2):
+                                prefetch_row = mma_tile_m * self.mma_tiler[0] + cute.arch.lane_idx() + prefetch_half * 32
+                                if prefetch_row < fc2_weight_gemm.shape[0]:
+                                    prefetch_ptr = cute.domain_offset(
+                                        (prefetch_row, (k_tile + getattr(self, "weight_prefetch_ahead", 0)) * self.mma_tiler[2], work_tile_info.expert_idx),
+                                        fc2_weight_gemm,
+                                    ).iterator
+                                    prefetch_global_l2(prefetch_ptr.toint())
                     iket.range_push('tma_weight_fc2_empty_wait')
                     handle = a_producer.acquire_and_advance(peek_ab_empty_status)
                     iket.range_pop()
@@ -405,7 +422,18 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoEMxfp8SwapABKernel):
                     if handle.count + 1 < k_tile_cnt:
                         peek_ab_empty_status = a_producer.try_acquire()
                     iket.range_push('tma_weight_fc2_issue')
-                    cute.copy(tma_atom_fc2_weight, tAgA_slice[None, handle.count], tAsA[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_a, mcast_mask=a_full_mcast_mask)
+                    cute.copy(
+                        tma_atom_fc2_weight,
+                        tAgA_slice[None, handle.count],
+                        tAsA[None, handle.index],
+                        cache_policy=cutlass.Int64(
+                            0x12F0000000000000
+                            if self.weight_eviction_policy == "evict_first" else 0
+                        ),
+                        tma_bar_ptr=handle.barrier,
+                        tma_desc_ptr=desc_ptr_a,
+                        mcast_mask=a_full_mcast_mask,
+                    )
                     if cutlass.const_expr(UseScaleTma):
                         cute.copy(tma_atom_fc2_weight_sf, tAgSFA_slice[None, handle.count], tAsSFA[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_sfa, mcast_mask=sfa_full_mcast_mask)
                     iket.range_pop()
@@ -432,11 +460,10 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoEMxfp8SwapABKernel):
                 iket.range_push('tma_token_fc2')
                 counter_slot = (
                     work_tile_info.cumulative_token_block_count
-                    + work_tile_info.tile_n_idx
-                    * cutlass.Int32(
-                        self.mma_tiler[1]
-                        // self.fc1_ready_tile_tokens
-                    )
+                    + (
+                        work_tile_info.tile_n_idx * cutlass.Int32(self.mma_tiler[1])
+                        // cutlass.Int32(self.k2_ready_tile_tokens)
+                    ) * cutlass.Int32(self.fc1_producer_tiles_per_ready_block)
                 )
                 if cutlass.const_expr(token_comm_args is None):
                     counter_ptr = fc1_done_counter.iterator + counter_slot
@@ -513,7 +540,7 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoEMxfp8SwapABKernel):
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if handle.count + 1 < k_tile_cnt:
                         peek_ab_empty_status = b_producer.try_acquire()
-                    cute.copy(tma_atom_fc1_output_as_fc2_input, tBgB_slice[None, handle.count], tBsB[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_b, mcast_mask=b_full_mcast_mask)
+                    cute.copy(tma_atom_fc1_output_as_fc2_input, tBgB_slice[None, handle.count], tBsB[None, handle.index], cache_policy=cutlass.Int64(0x14F0000000000000 if self.activation_eviction_policy == "evict_last" else 0), tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_b, mcast_mask=b_full_mcast_mask)
                     if cutlass.const_expr(UseScaleTma):
                         cute.copy(tma_atom_fc1_output_sf_as_fc2_input, tBgSFB_slice[None, handle.count], tBsSFB[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_sfb, mcast_mask=sfb_full_mcast_mask)
                 iket.range_pop()
@@ -921,6 +948,15 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoEMxfp8SwapABKernel):
                                     + pool_token0
                                 ]
                             )
+                        # Widen after the optional pool-to-stage mapping: a
+                        # destination-rank segment can exceed 2**31 BF16
+                        # elements even when this rank receives few routes.
+                        # CuTe must multiply the row stride in 64 bits.
+                        if cutlass.const_expr(
+                            (self.token_back_by_dispatch or self.rank_local_combine)
+                            and self.pool_token_capacity * self.hidden >= (1 << 31)
+                        ):
+                            fc2_store_token0 = cutlass.Int64(fc2_store_token0)
                         if cutlass.const_expr(self.fc2_packed_store):
                             if lane_g & cutlass.Int32(1) == cutlass.Int32(0):
                                 if cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch)):
@@ -967,6 +1003,15 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoEMxfp8SwapABKernel):
                                     + pool_token1
                                 ]
                             )
+                        # Widen after the optional pool-to-stage mapping: a
+                        # destination-rank segment can exceed 2**31 BF16
+                        # elements even when this rank receives few routes.
+                        # CuTe must multiply the row stride in 64 bits.
+                        if cutlass.const_expr(
+                            (self.token_back_by_dispatch or self.rank_local_combine)
+                            and self.pool_token_capacity * self.hidden >= (1 << 31)
+                        ):
+                            fc2_store_token1 = cutlass.Int64(fc2_store_token1)
                         if cutlass.const_expr(self.fc2_packed_store):
                             if lane_g & cutlass.Int32(1) == cutlass.Int32(0):
                                 if cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch)):

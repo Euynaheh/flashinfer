@@ -9,16 +9,12 @@ from typing import List, Optional, Tuple
 import torch
 
 from common.megamoe_constants import (
-    Fp8E5M2Max,
-    Fp8E4M3FNMax,
     Nvfp4E2M1Max,
     Nvfp4BlockSize,
     Mxfp8BlockSize,
     SfPaddingBlock,
     TmaLeadingDimByteAlign,
     Nvfp4E2M1RcpLimit,
-    Fp8E4M3RcpLimit,
-    Fp8E5M2RcpLimit,
 )
 
 # ---------------------------------------------------------------------------
@@ -78,6 +74,37 @@ def kind_sf_vec_size(kind: str) -> int:
 # Mxfp8 quantize function. May move function to mxfp8 folder later
 # ---------------------------------------------------------------------------
 
+def _mxfp8_e8m0_scale_raw(
+    absmax: torch.Tensor,
+    data_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return the exact E8M0 scale byte for a non-negative FP32 amax.
+
+    An FP8 limit is ``1.75 * 2**k``.  For ``absmax = m * 2**e`` from
+    ``frexp`` (``0.5 <= m < 1``), the rounded-up scale exponent is
+    ``e - k - 1 + (m > 0.875)``.  This avoids both an arbitrary lower clamp
+    and floating-point ``log2`` rounding at the 1.75 threshold.
+    """
+    if data_dtype == torch.float8_e4m3fn:
+        limit_exponent = 8
+    elif data_dtype == torch.float8_e5m2:
+        limit_exponent = 15
+    else:
+        raise ValueError(f"Unsupported MXFP8 data dtype: {data_dtype}.")
+
+    significand, exponent = torch.frexp(absmax)
+    scale_exp = (
+        exponent.to(torch.int32)
+        - (limit_exponent + 1)
+        + (significand > 0.875).to(torch.int32)
+    )
+    raw = torch.clamp(scale_exp + 127, min=0, max=254)
+    raw = torch.where(absmax == 0, torch.zeros_like(raw), raw)
+    return torch.where(
+        torch.isfinite(absmax), raw, torch.full_like(raw, 254)
+    )
+
+
 def mxfp8_quantize_per_block_32_row(
     c_fp32: torch.Tensor,
     data_dtype: torch.dtype,
@@ -89,13 +116,9 @@ def mxfp8_quantize_per_block_32_row(
             f"Trailing dim ({N}) must be a multiple of sf_vec_size ({Mxfp8BlockSize})."
         )
     n_blocks = N // Mxfp8BlockSize
-    data_max_rcp_limit = Fp8E4M3RcpLimit if data_dtype == torch.float8_e4m3fn else Fp8E5M2RcpLimit
     blocked = c_fp32.view(M, n_blocks, Mxfp8BlockSize)
     absmax = blocked.abs().amax(dim=-1)
-    safe_absmax = torch.clamp(absmax, min=1e-30)
-    scale_exp = torch.ceil(torch.log2(safe_absmax * data_max_rcp_limit))
-    e_uint8 = torch.clamp(scale_exp + 127.0, min=0.0, max=254.0).to(torch.int32)
-    e_uint8 = torch.where(absmax == 0, torch.zeros_like(e_uint8), e_uint8)
+    e_uint8 = _mxfp8_e8m0_scale_raw(absmax, data_dtype)
     sfc_e8m0 = e_uint8.to(torch.uint8).view(_Mxfp8ScaleDtype)
     scale_fp32 = torch.pow(2.0, e_uint8.float() - 127.0)
     scale_expanded = scale_fp32.unsqueeze(-1).expand_as(blocked).reshape(M, N)
@@ -121,13 +144,9 @@ def mxfp8_quantize_per_block_32_col(
             f"Leading dim ({M}) must be a multiple of sf_vec_size ({Mxfp8BlockSize})."
         )
     m_blocks = M // Mxfp8BlockSize
-    data_max_rcp_limit = Fp8E4M3RcpLimit if data_dtype == torch.float8_e4m3fn else Fp8E5M2RcpLimit
     blocked = c_fp32.view(m_blocks, Mxfp8BlockSize, N)
     absmax = blocked.abs().amax(dim=1)  # (m_blocks, N)
-    safe_absmax = torch.clamp(absmax, min=1e-30)
-    scale_exp = torch.ceil(torch.log2(safe_absmax * data_max_rcp_limit))
-    e_uint8 = torch.clamp(scale_exp + 127.0, min=0.0, max=254.0).to(torch.int32)
-    e_uint8 = torch.where(absmax == 0, torch.zeros_like(e_uint8), e_uint8)
+    e_uint8 = _mxfp8_e8m0_scale_raw(absmax, data_dtype)
     sfc_e8m0 = e_uint8.to(torch.uint8).view(_Mxfp8ScaleDtype)
     scale_fp32 = torch.pow(2.0, e_uint8.float() - 127.0)
     scale_expanded = scale_fp32.unsqueeze(1).expand_as(blocked).reshape(M, N)
@@ -201,10 +220,17 @@ def compare_and_report_mismatches(
                 f"{i + 1:<6} {str(coord):<30} {gpu_val:<20.6f} {ref_val:<20.6f} {abs_error:<20.6f}"
             )
 
-    # Compute differences
-    diff = _torch.abs(gpu_data.float() - ref_data.float())
-    threshold = atol + rtol * _torch.abs(ref_data.float())
-    mismatch_mask = diff > threshold
+    # Compute differences.  Non-finite values are always mismatches: relying
+    # only on ``diff > threshold`` would let NaNs (and equal infinities) pass.
+    gpu_float = gpu_data.float()
+    ref_float = ref_data.float()
+    diff = _torch.abs(gpu_float - ref_float)
+    threshold = atol + rtol * _torch.abs(ref_float)
+    mismatch_mask = (
+        ~_torch.isfinite(gpu_float)
+        | ~_torch.isfinite(ref_float)
+        | (diff > threshold)
+    )
 
     # Find all mismatch indices
     mismatch_indices = _torch.nonzero(mismatch_mask, as_tuple=False)

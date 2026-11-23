@@ -51,19 +51,64 @@ from dataclasses import dataclass
 # -----------------------------------------------------------------
 
 
+@dsl_user_op
+def zero_unless_equal(
+    value: Float32,
+    raw: Float32,
+    clamped: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """Return ``value`` when ``raw == clamped``; otherwise return zero."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(value).ir_value(loc=loc, ip=ip),
+                Float32(raw).ir_value(loc=loc, ip=ip),
+                Float32(clamped).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n"
+            "  .reg .pred in_range;\n"
+            "  setp.eq.f32 in_range, $2, $3;\n"
+            "  selp.f32 $0, $1, 0f00000000, in_range;\n"
+            "}",
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 @cute.jit
 def swiglu_act(
     t_swiglu: cute.Tensor,
     t_up: cute.Tensor,
     t_gate: cute.Tensor,
     prob: Optional[Float32] = None,
+    gate_up_clamp: Optional[Float32] = None,
 ) -> None:
     """
     SwiGLU activation with prob function.
     """
     for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
+        gate = (t_gate[i], t_gate[i + 1])
+        up = (t_up[i], t_up[i + 1])
+        if cutlass.const_expr(gate_up_clamp is not None):
+            gate = (
+                cute.arch.fmin(gate[0], gate_up_clamp),
+                cute.arch.fmin(gate[1], gate_up_clamp),
+            )
+            up = (
+                cute.arch.fmax(cute.arch.fmin(up[0], gate_up_clamp), -gate_up_clamp),
+                cute.arch.fmax(cute.arch.fmin(up[1], gate_up_clamp), -gate_up_clamp),
+            )
         t_swiglu_log2e = cute.arch.mul_packed_f32x2(
-            (t_gate[i], t_gate[i + 1]),
+            gate,
             (-Log2E, -Log2E),
             rnd='rn',
             ftz=False,
@@ -85,7 +130,7 @@ def swiglu_act(
             t_swiglu[i + 1],
         ) = cute.arch.mul_packed_f32x2(
             (t_swiglu[i], t_swiglu[i + 1]),
-            (t_gate[i + 0], t_gate[i + 1]),
+            gate,
             rnd='rn',
             ftz=False,
         )
@@ -94,7 +139,7 @@ def swiglu_act(
             t_swiglu[i + 1],
         ) = cute.arch.mul_packed_f32x2(
             (t_swiglu[i], t_swiglu[i + 1]),
-            (t_up[i], t_up[i + 1]),
+            up,
             rnd='rn',
             ftz=False,
         )
@@ -119,6 +164,7 @@ def dswiglu_act(
     t_up: cute.Tensor,
     beta_val: cutlass.Float32,
     prob: cutlass.Float32,
+    gate_up_clamp: Optional[Float32] = None,
 ) -> cutlass.Float32:
     """SwiGLU backward with beta scaling, prob weighting, and dprob accumulation.
 
@@ -138,18 +184,29 @@ def dswiglu_act(
     dprob_acc = cutlass.Float32(0.0)
     for i in cutlass.range_constexpr(0, cute.size(t_acc), 2):
         # gate_b = gate * beta, up_b = up * beta
-        gate_b = cute.arch.mul_packed_f32x2(
+        gate_raw = cute.arch.mul_packed_f32x2(
             (t_gate[i], t_gate[i + 1]),
             (beta_val, beta_val),
             rnd='rn',
             ftz=False,
         )
-        up_b = cute.arch.mul_packed_f32x2(
+        up_raw = cute.arch.mul_packed_f32x2(
             (t_up[i], t_up[i + 1]),
             (beta_val, beta_val),
             rnd='rn',
             ftz=False,
         )
+        gate_b = gate_raw
+        up_b = up_raw
+        if cutlass.const_expr(gate_up_clamp is not None):
+            gate_b = (
+                cute.arch.fmin(gate_raw[0], gate_up_clamp),
+                cute.arch.fmin(gate_raw[1], gate_up_clamp),
+            )
+            up_b = (
+                cute.arch.fmax(cute.arch.fmin(up_raw[0], gate_up_clamp), -gate_up_clamp),
+                cute.arch.fmax(cute.arch.fmin(up_raw[1], gate_up_clamp), -gate_up_clamp),
+            )
 
         # sig = 1 / (1 + exp(-gate_b)); exp(-x) = exp2(-Log2E * x)
         sig_rcp = cute.arch.mul_packed_f32x2(
@@ -252,6 +309,11 @@ def dswiglu_act(
             rnd='rn',
             ftz=False,
         )
+        if cutlass.const_expr(gate_up_clamp is not None):
+            t_dgate[i] = zero_unless_equal(t_dgate[i], gate_raw[0], gate_b[0])
+            t_dgate[i + 1] = zero_unless_equal(t_dgate[i + 1], gate_raw[1], gate_b[1])
+            t_dup[i] = zero_unless_equal(t_dup[i], up_raw[0], up_b[0])
+            t_dup[i + 1] = zero_unless_equal(t_dup[i + 1], up_raw[1], up_b[1])
     return dprob_acc
 
 

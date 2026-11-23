@@ -9,13 +9,15 @@ benchmark runner may apply explicit user overrides after selection.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Optional, Tuple
 
 
 Tile = Tuple[int, int, int]
 
-# Same-NUMA EP4 decode buckets validated on RTX Pro 5000. K1 remains N32;
-# only K2 benefits from N16 at these graph-row counts. The mapping value is
+# Legacy same-NUMA EP4 decode buckets validated on RTX Pro 5000. This
+# layer keeps K1 N32. The independently qualified FC1 overlay below adds
+# utility postprocessing; N16 remains explicit after routing holdouts. The mapping value is
 # the ready-queue bundle selected by the controlled N16 sweep. Keep the
 # single-group K2 until the dual-group 76-CTA replay lifecycle is proven safe
 # for the full 4096-wide production shape.
@@ -140,6 +142,11 @@ def _scale_sm_partition(
 
     return (*counts, remainder)
 
+# Largest expected rows per expert at which two resident CTAs of one kernel
+# per SM (k1_ctas_per_sm=2, k2_launch_factor=2) were found bit-exact.
+RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT = 32.0
+
+
 @dataclass(frozen=True)
 class MegaMoEHeuristicInput:
     """Runtime shape, parallel decomposition, and EP-group topology."""
@@ -157,6 +164,9 @@ class MegaMoEHeuristicInput:
     num_sms: int
     sm_min_partition: int
     sm_partition_alignment: int
+    # p2p_split: cross-NUMA peers are served through local shadow segments
+    # and are therefore counted as same-NUMA peers above.
+    ep_numa_split: bool = False
 
     @property
     def expected_rows_per_expert(self) -> float:
@@ -305,6 +315,15 @@ class MegaMoEHeuristicOverrides:
     dispatch_rank_cache: Optional[bool] = None
     dispatch_rank_cache_debug: Optional[bool] = None
     rank_local_combine: Optional[bool] = None
+    fc1_utility_postprocess: Optional[bool] = None
+    # None selects the qualified automatic overlay; "default" forces legacy.
+    weight_eviction_policy: Optional[str] = None
+    activation_eviction_policy: Optional[str] = None
+    # Residency / pipeline knobs (None keeps the selected value).
+    k1_ctas_per_sm: Optional[int] = None
+    k1_stages: Optional[int] = None
+    k2_launch_factor: Optional[int] = None
+    weight_prefetch_ahead: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -355,6 +374,52 @@ class MegaMoEKernelConfig:
     k2_tail_reclaim: bool
 
     expected_rows_per_expert: float
+    fc1_utility_postprocess: bool = False
+    weight_eviction_policy: str = "default"
+    activation_eviction_policy: str = "default"
+    # K1 CTAs resident per K1 SM (2 = dual residency: K1 grid, scheduler and
+    # producer counts double on the same physical SMs; needs 1 dispatch warp).
+    k1_ctas_per_sm: int = 1
+    # K1 TMA A/B pipeline depth; None keeps the kernel's own choice.
+    k1_stages: Optional[int] = None
+    # Multiplier on the K2 launch grid for 8-warp K2 (compiled for two CTAs
+    # per SM but launched one per SM by default).
+    k2_launch_factor: int = 1
+    # K tiles ahead for the K1/K2 weight-producer L2 prefetch (0 = off).
+    weight_prefetch_ahead: int = 0
+
+    def __post_init__(self):
+        if self.weight_prefetch_ahead not in (0, 4, 8):
+            raise ValueError("weight_prefetch_ahead must be 0, 4 or 8")
+        if self.k1_ctas_per_sm not in (1, 2):
+            raise ValueError("k1_ctas_per_sm must be 1 or 2")
+        if self.k1_stages is not None and self.k1_stages not in (2, 3, 4, 5):
+            raise ValueError("k1_stages must be 2..5 or None")
+        if self.k2_launch_factor not in (1, 2):
+            raise ValueError("k2_launch_factor must be 1 or 2")
+        if self.k2_launch_factor == 2 and self.k2_warps == 12:
+            raise ValueError("k2_launch_factor=2 applies to 8-warp K2 only (12-warp K2 already runs two CTAs/SM)")
+        if (self.k1_ctas_per_sm == 2 or self.k2_launch_factor == 2) and (
+                self.expected_rows_per_expert > RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT):
+            # Two CTAs of one kernel per SM produce intermittent wrong rows at
+            # higher load (dsv41 EP4 T1024: 5/20 runs; 0/16 at <= 32 rows).
+            raise ValueError(
+                "k1_ctas_per_sm=2 / k2_launch_factor=2 are qualified only up to "
+                f"{RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT} expected rows per expert")
+        if self.k2_tail_reclaim and self.kernel_comm_backend != "p2p_direct":
+            # The tail-reclaim drain stays resident on the K1 partition while
+            # the GIN ring TX/RX workers poll for progress: the graph
+            # deadlocks (reproduced with nvshmem_hybrid at T16 .. T24576).
+            raise ValueError("k2_tail_reclaim requires the p2p_direct kernel transport")
+        if self.k2_launch_factor == 2 and self.k2_tile[1] > 32:
+            # Two CTAs per SM must be co-resident: the persistent K2 grid
+            # synchronizes in software and deadlocks if one cannot launch.
+            # N64/N128 K2 tiles do not fit twice per SM.
+            raise ValueError("k2_launch_factor=2 needs a K2 tile with N <= 32 (two CTAs per SM)")
+        if self.activation_eviction_policy not in ("default", "evict_last"):
+            raise ValueError("activation_eviction_policy must be default or evict_last")
+        if self.weight_eviction_policy not in ("default", "evict_first"):
+            raise ValueError("weight_eviction_policy must be default or evict_first")
 
     @property
     def total_sms(self) -> int:
@@ -370,6 +435,10 @@ class MegaMoEKernelConfig:
             raise ValueError("ready_queue_bundle must be positive")
         if overrides.k2_warps is not None and overrides.k2_warps not in (8, 12):
             raise ValueError("k2_warps must be 8 or 12")
+        if overrides.activation_eviction_policy not in (None, "default", "evict_last"):
+            raise ValueError("activation_eviction_policy must be default or evict_last")
+        if overrides.weight_eviction_policy not in (None, "default", "evict_first"):
+            raise ValueError("weight_eviction_policy must be default or evict_first")
         updates = {
             name: value
             for name, value in vars(overrides).items()
@@ -424,12 +493,17 @@ class MegaMoEKernelConfig:
                 if config.k2_tile[1] == 64
                 else _LOCAL_DEFAULT_SM_PARTITION
             )
-            k1_sms, k2_sms = _scale_sm_partition(
-                num_sms=config.total_sms,
-                reference_counts=reference,
-                min_partition=config.sm_min_partition,
-                alignment=config.sm_partition_alignment,
-            )
+            if backend == self.comm_backend and config.k2_tile == self.k2_tile:
+                # Unrelated overrides must preserve the workload-selected
+                # partition (including the compact N64 64/46 preset).
+                k1_sms, k2_sms = self.k1_sms, self.k2_sms
+            else:
+                k1_sms, k2_sms = _scale_sm_partition(
+                    num_sms=config.total_sms,
+                    reference_counts=reference,
+                    min_partition=config.sm_min_partition,
+                    alignment=config.sm_partition_alignment,
+                )
             config = replace(
                 config,
                 comm_backend=backend,
@@ -479,7 +553,7 @@ class MegaMoEKernelConfig:
         return config
 
 
-def select_megamoe_config(
+def select_legacy_config(
     shape: MegaMoEHeuristicInput,
     overrides: Optional[MegaMoEHeuristicOverrides] = None,
 ) -> MegaMoEKernelConfig:
@@ -533,6 +607,18 @@ def select_megamoe_config(
             if token_n == 64
             else _LOCAL_DEFAULT_SM_PARTITION
         )
+        # Medium N64 waves with compact activation/weight rows are K2-tail
+        # limited. The measured 64/46 partition leaves more SMs for K2.
+        # Wider rows and N128 prefill retain their previous partition.
+        if (
+            token_n == 64
+            and shape.expert_parallel_size == 4
+            and shape.tensor_parallel_size == 1
+            and shape.num_sms == 110
+            and shape.hidden <= 4096
+            and shape.intermediate <= 4096
+        ):
+            reference = (64, 46)
         k1_sms, k2_sms = _scale_sm_partition(
             num_sms=shape.num_sms,
             reference_counts=reference,
@@ -633,7 +719,20 @@ def select_megamoe_config(
         token_back_mode=(
             "reuse_dispatch_warps" if cross_numa else "epi_warps"
         ),
-        k1_tile=tile,
+        # Near half-filled N128 waves, wide FC1 rows favor finer token
+        # tiling. Keep K2 N128: reducing both tiles regressed in controls.
+        k1_tile=(
+            (64, 64, 128)
+            if (
+                not cross_numa
+                and shape.expert_parallel_size == 4
+                and shape.tensor_parallel_size == 1
+                and shape.num_sms == 110
+                and shape.hidden >= 6144
+                and 64.0 <= rows < 96.0
+            )
+            else tile
+        ),
         k2_tile=tile,
         k2_stages=(
             3
@@ -823,6 +922,241 @@ def select_megamoe_config(
     if shape.tensor_parallel_size == 1 and config.tp_k3_chunks != 1:
         raise ValueError("TP1 requires tp_k3_chunks=1")
     return config
+
+
+@lru_cache(maxsize=1)
+def _builtin_policy():
+    # Private immutable-in-practice calibration data; never returned to callers.
+    import json
+    from pathlib import Path
+    return json.loads(Path(__file__).with_name("model_policy.json").read_text())
+
+
+def _with_tuned_table(shape, overrides):
+    """Fill unset overrides from the ``tuned_table.json`` anchor entry.
+
+    Table knobs are exactly the runner flags the tuner measured on top of the
+    built-in selection, so they enter as overrides (explicit ones win) and
+    the normal selection path below runs unchanged. A caller-forced backend
+    other than the entry's leaves the table out.
+    """
+    from . import tuned_table
+
+    entry = tuned_table.lookup(shape)
+    if entry is None:
+        return overrides
+    table = tuned_table.overrides_for(entry["knobs"])
+    user = {k: v for k, v in vars(overrides).items() if v is not None} if overrides else {}
+    if "comm_backend" in user and user["comm_backend"] != table.get("comm_backend", "p2p_direct"):
+        return overrides
+    if not table or set(table) <= {"comm_backend", "token_back_mode"}:
+        return overrides  # the default won at this anchor: built-in selection stays in charge
+    # Knobs are changes relative to the built-in selection *at the anchor*.
+    # Pin that selection's geometry so every token count mapped to the anchor
+    # runs the measured configuration (the built-in tile choice changes with
+    # tokens and may not combine with e.g. dual K1 residency).
+    # Resolve exactly what the tuner measured: the built-in selection at the
+    # anchor with the entry's knobs as overrides.
+    anchor = replace(shape, tokens_per_rank=int(entry["tokens"]))
+    measured, _ = _select_config_and_dispatch_base(
+        anchor, MegaMoEHeuristicOverrides(**{k: v for k, v in table.items()
+                                             if k != "weight_eviction_policy"}))
+    merged = {name: getattr(measured, name) for name in _PINNED_FROM_ANCHOR}
+    merged.update(table)
+    if shape.expected_rows_per_expert > RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT:
+        # The anchor may be qualified for residency doubling; this load is not.
+        # Its K1 stage count was sized for two CTAs per SM only if the entry
+        # doubled residency; otherwise it is the measured single-CTA value.
+        doubled = merged.get("k1_ctas_per_sm") == 2 or merged.get("k2_launch_factor") == 2
+        merged.update(k1_ctas_per_sm=1, k2_launch_factor=1)
+        if doubled:
+            merged["k1_stages"] = None
+    merged.update(user)
+    return MegaMoEHeuristicOverrides(**merged)
+
+
+_PINNED_FROM_ANCHOR = (
+    "k1_tile", "k2_tile", "k2_stages", "k2_warps", "ready_queue_bundle",
+    "k1_sms", "k2_sms", "tx_sms", "rx_sms", "k2_tail_reclaim", "dispatch_chunk_tokens",
+    "rank_local_combine", "fc1_utility_postprocess", "k1_ctas_per_sm", "k1_stages",
+    "k2_launch_factor", "weight_prefetch_ahead",
+)
+
+
+def _select_config_and_dispatch_base(shape, overrides=None, *, use_tuned_defaults=True):
+    """Resolve the calibrated tile, resource, dispatch and utility policy.
+
+    The public selector caches the final result including the weight policy.
+    Explicit overrides remain authoritative; callers can opt out of built-in
+    calibration with use_tuned_defaults=False. No CUDA state is kept.
+    """
+    # Validate user overrides before merging: partial SM presets must not be
+    # accidentally accepted by filling their missing fields from the profile.
+    incumbent = select_legacy_config(shape, overrides)
+    if not use_tuned_defaults or not (
+        (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
+        in ((4096, 4096, 6, 256), (4096, 4096, 8, 288))
+        and (shape.expert_parallel_size, shape.tensor_parallel_size,
+             shape.data_parallel_size, shape.ep_same_numa_peer_count,
+             shape.ep_cross_numa_peer_count, shape.num_sms,
+             shape.sm_min_partition, shape.sm_partition_alignment)
+        == (4, 1, 1, 3, 0, 110, 8, 8)
+        and incumbent.comm_backend == "p2p_direct"
+        and incumbent.token_back_mode == "epi_warps"
+    ):
+        return incumbent, None
+    if not 16 <= shape.tokens_per_rank <= 24576:
+        # Boundary measurements varied only utility on the legacy preset.
+        # Do not extend the calibrated tile/resource/dispatch domain with it.
+        base = select_legacy_config(shape)
+        if overrides is not None and any(
+            value is not None and value != getattr(base, key)
+            for key, value in vars(overrides).items()
+            if key != "fc1_utility_postprocess"
+        ):
+            return incumbent, None
+        if overrides is not None and overrides.fc1_utility_postprocess is not None:
+            return incumbent, None
+        signature = [shape.hidden, shape.intermediate, shape.num_topk,
+                     shape.num_total_experts]
+        for row in _builtin_policy().get("fc1_postprocess", {}).get("ranges", []):
+            if (row["signature"] == signature
+                    and row["tokens"][0] <= shape.tokens_per_rank <= row["tokens"][1]
+                    and (not row.get("requires_rank_local_combine", False)
+                         or incumbent.rank_local_combine)):
+                return replace(incumbent, fc1_utility_postprocess=row["utility"]), None
+        return incumbent, None
+    from .model_policy import select
+    base = select_legacy_config(shape)
+    compact = dict(k1=base.k1_tile[1], k2=base.k2_tile[1],
+        stage=base.k2_stages, sm=base.k1_sms, bundle=base.ready_queue_bundle,
+        warps=base.k2_warps, tail=base.k2_tail_reclaim,
+        cache=base.dispatch_rank_cache, lc=base.rank_local_combine, dispatch=1)
+    # The legacy dispatch rule for these two shapes; keep calibration's input
+    # identical to the frozen explicit selector, including fallback regions.
+    if base.expected_rows_per_expert > 192 and not (
+        base.rank_local_combine and shape.num_topk == 6
+    ):
+        compact['dispatch'] = 4
+    config, _ = select(dict(t=shape.tokens_per_rank, h=shape.hidden,
+        i=shape.intermediate, k=shape.num_topk, e=shape.num_total_experts),
+        _builtin_policy(), compact)
+    defaults = dict(k1_tile=(64, config['k1'], 128),
+        k2_tile=(64, config['k2'], 128), k2_stages=config['stage'],
+        k1_sms=config['sm'], k2_sms=110-config['sm'], tx_sms=0, rx_sms=0,
+        ready_queue_bundle=config['bundle'], k2_warps=config['warps'],
+        k2_tail_reclaim=config['tail'], dispatch_rank_cache=config['cache'],
+        rank_local_combine=config['lc'])
+    # A separately qualified FC1 layer preserves the complete transport/K2
+    # preset above. Its bounded ranges are measured jointly, not inferred by
+    # adding the isolated N16 and utility gains. Custom resource presets do
+    # not automatically inherit this layer; explicit utility overrides still
+    # remain authoritative below.
+    fc1_default = None
+    custom_preset = overrides is not None and any(
+        getattr(overrides, key) is not None
+        and getattr(overrides, key) != value
+        for key, value in defaults.items() if key != 'k1_tile'
+    )
+    if not custom_preset:
+        signature = [shape.hidden, shape.intermediate, shape.num_topk,
+                     shape.num_total_experts]
+        for row in _builtin_policy().get('fc1_postprocess', {}).get('ranges', []):
+            if (row['signature'] == signature
+                    and row['tokens'][0] <= shape.tokens_per_rank <= row['tokens'][1]
+                    and (not row.get('requires_rank_local_combine', False)
+                         or defaults['rank_local_combine'])):
+                fc1_default = row
+                break
+    qualified_k1_tile = (
+        (64, fc1_default['k1_n'], 128)
+        if fc1_default is not None and 'k1_n' in fc1_default
+        else defaults['k1_tile']
+    )
+    # Changing tile/warp geometry leaves the calibrated complete preset.
+    # Retain legacy dependent defaults (e.g. disabling dual N8 disables tail).
+    if overrides is not None and any(
+        getattr(overrides, key) is not None
+        and getattr(overrides, key) not in (
+            (defaults[key], qualified_k1_tile) if key == 'k1_tile'
+            else (defaults[key],)
+        )
+        for key in ('k1_tile', 'k2_tile', 'k2_warps')
+    ):
+        return incumbent, None
+    if overrides is not None and overrides.dispatch_rank_cache_debug:
+        return incumbent, None
+    if fc1_default is not None:
+        defaults.update(k1_tile=qualified_k1_tile,
+                        fc1_utility_postprocess=fc1_default['utility'])
+    defaults.update({k:v for k,v in vars(overrides or MegaMoEHeuristicOverrides()).items()
+                     if v is not None})
+    selected = select_legacy_config(shape, MegaMoEHeuristicOverrides(**defaults))
+    return selected, config['dispatch']
+
+
+def _select_weight_cache_policy(shape, config, *, activation=False):
+    """Use only qualified shapes with the complete, unchanged launch preset.
+
+    L2 eviction priority affects reuse across both weight streams. A useful
+    small-token result does not imply that larger or custom presets benefit.
+    """
+    ep = shape.expert_parallel_size
+    if not (
+        ep in (4, 8)
+        and shape.data_parallel_size == shape.tensor_parallel_size == 1
+        and shape.num_sms == 110
+        and shape.sm_min_partition == shape.sm_partition_alignment == 8
+        and shape.ep_same_numa_peer_count == 3
+        and shape.ep_cross_numa_peer_count == ep - 4
+    ):
+        return "default"
+    signature = [shape.hidden, shape.intermediate, shape.num_topk,
+                 shape.num_total_experts]
+    for row in _builtin_policy().get("weight_cache", {}).get("ranges", []):
+        if (row["ep"] == ep and row["signature"] == signature
+                and row["tokens"][0] <= shape.tokens_per_rank <= row["tokens"][1]):
+            reference, _ = _select_config_and_dispatch_base(shape)
+            if config == reference:
+                return (row.get("activation", "default") if activation else "evict_first")
+            break
+    return "default"
+
+
+@lru_cache(maxsize=256)
+def select_config_and_dispatch(shape, overrides=None, *, use_tuned_defaults=True):
+    """Resolve geometry first, then independently select both TMA cache hints.
+
+    The policy is a performance hint shared by FC1, FC2 and tail drain. It
+    changes neither synchronization nor tile/transport resource selection.
+    """
+    if use_tuned_defaults:
+        overrides = _with_tuned_table(shape, overrides)
+    explicit = overrides.weight_eviction_policy if overrides is not None else None
+    if explicit not in (None, "default", "evict_first"):
+        raise ValueError("weight_eviction_policy must be default or evict_first")
+    activation_explicit = overrides.activation_eviction_policy if overrides is not None else None
+    if activation_explicit not in (None, "default", "evict_last"):
+        raise ValueError("activation_eviction_policy must be default or evict_last")
+    geometry_overrides = (replace(overrides, weight_eviction_policy=None, activation_eviction_policy=None)
+                          if overrides is not None else None)
+    config, dispatch = _select_config_and_dispatch_base(
+        shape, geometry_overrides, use_tuned_defaults=use_tuned_defaults)
+    # The cache overlay is independent of tile and transport selection.
+    policy = (explicit if explicit is not None else
+              _select_weight_cache_policy(shape, config) if use_tuned_defaults
+              else "default")
+    activation_policy = (activation_explicit if activation_explicit is not None else
+        _select_weight_cache_policy(shape, config, activation=True)
+        if use_tuned_defaults else "default")
+    return replace(config, weight_eviction_policy=policy,
+                   activation_eviction_policy=activation_policy), dispatch
+
+
+def select_megamoe_config(shape, overrides=None, *, use_tuned_defaults=True):
+    """Select built-in defaults with explicit overrides and legacy fallback."""
+    return select_config_and_dispatch(shape, overrides,
+        use_tuned_defaults=use_tuned_defaults)[0]
 
 
 __all__ = [

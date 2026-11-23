@@ -1,11 +1,11 @@
 """Low-overhead cross-Green-Context timestamp tracing."""
 
 from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import Int64, T, dsl_user_op
+from cutlass.cutlass_dsl import Int64, Int32, T, dsl_user_op
 
 
 TRACE_CTA_CAPACITY = 256
-TRACE_FIELDS = 17
+TRACE_FIELDS = 18
 TRACE_ROLES = 4
 TRACE_TMA_WAIT_SAMPLE_STRIDE = 8
 
@@ -38,6 +38,7 @@ FIELD_MAINLOOP_NS = 13
 FIELD_STORE_NS = 14
 FIELD_TMA_A_TIMED_CALLS = 15
 FIELD_TMA_B_TIMED_CALLS = 16
+FIELD_SMID = 17
 
 K2_TILE_FIELD_TILE_ID = 0
 K2_TILE_FIELD_DEQUEUE_BEGIN = 1
@@ -107,3 +108,9 @@ def pack_tile_id(expert_idx, tile_n_idx, tile_m_idx):
         + Int64(tile_n_idx) * TILE_ID_COORD_BASE
         + Int64(tile_m_idx)
     )
+
+
+@dsl_user_op
+def read_smid(*, loc=None, ip=None) -> Int32:
+    return Int32(llvm.inline_asm(T.i32(), [], "mov.u32 $0, %smid;", "=r",
+        has_side_effects=True, asm_dialect=0, loc=loc, ip=ip))

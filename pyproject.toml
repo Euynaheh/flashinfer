@@ -142,6 +142,15 @@ exclude = [
 "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.shims.sm107.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernels.flashinfer.sm120_split" = ["*.md"]
+# Tuned tables, NCCL host bridge sources and prebuilt NCCL device bitcode of the SM120 W4A8 drop.
+"flashinfer.moe_ep.kernels.flashinfer.sm120_split.moe_sm120_mxfp4mxfp8_split" = [
+  "*.json",
+  "*.md",
+  "transport/nccl/*.cc",
+  "transport/nccl/*.cu",
+  "transport/nccl/*.h",
+  "transport/nccl/prebuilt/*",
+]
 "flashinfer.moe_ep.kernels.flashinfer.sm120_swapab" = ["*.md"]
 "flashinfer.moe_ep.kernels.kimi_k3" = ["*.md", "*.json", "LICENSE", "NOTICE"]
 "flashinfer.prims_ts.moe" = [

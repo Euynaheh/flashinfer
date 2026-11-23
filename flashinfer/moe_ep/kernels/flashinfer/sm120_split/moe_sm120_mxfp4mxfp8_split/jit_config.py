@@ -41,6 +41,8 @@ class Sm120JitConfig:
     k2_token_stripe: int = 2
     fc2_ready_bundle_k_tiles: int = 12
     fc2_packed_store: Optional[bool] = None
+    # False retains the half-warp path for controlled comparisons.
+    rank_local_combine_vectorized: bool = True
     num_ab_stages_override: Optional[int] = None
     enable_globaltimer: bool = False
     enable_k2_tile_trace: bool = False
