@@ -11,6 +11,7 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 from .sm120_ptx_helpers import prefetch_global_l2
+from . import phase_stamps as _ps
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- wheels without cute.iket
@@ -462,6 +463,10 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
         trace_role = ROLE_K2
         if cutlass.const_expr(self.green_trace_role is not None):
             trace_role = self.green_trace_role
+        if cutlass.const_expr(_ps.ENABLED):
+            if warp_idx == cutlass.Int32(0):
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    _ps.stamp('k2_entry', read_globaltimer())
         if cutlass.const_expr(green_trace is not None):
             if warp_idx == cutlass.Int32(0):
                 if cute.arch.lane_idx() == cutlass.Int32(0):
@@ -955,6 +960,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
             work_tile_info = sched_consumer.consume_work()
             fc2_detail_tiles_seen = cutlass.Int32(0)
             green_trace_seen_work = cutlass.Int32(0)
+            ps_seen_work = cutlass.Int32(0)
             k2_trace_tile_count = cutlass.Int64(0)
             k2_trace_first_tile_id = cutlass.Int64(0)
             k2_trace_last_tile_id = cutlass.Int64(0)
@@ -1007,6 +1013,12 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                                     tile_begin,
                                     scope="gpu",
                                 )
+                if cutlass.const_expr(_ps.ENABLED):
+                    if compute_warp == cutlass.Int32(0):
+                        if lane_idx == cutlass.Int32(0):
+                            if ps_seen_work == cutlass.Int32(0):
+                                _ps.stamp('k2_first_tile', read_globaltimer())
+                                ps_seen_work = cutlass.Int32(1)
                 if cutlass.const_expr(green_trace is not None):
                     if compute_warp == cutlass.Int32(0):
                         if lane_idx == cutlass.Int32(0):
@@ -1591,6 +1603,10 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                                 )
                             compute_tile_seq += cutlass.Int32(1)
                 work_tile_info = next_work_tile_info
+            if cutlass.const_expr(_ps.ENABLED):
+                if compute_warp == cutlass.Int32(0):
+                    if lane_idx == cutlass.Int32(0):
+                        _ps.stamp('k2_last_tile', read_globaltimer())
             if cutlass.const_expr(green_trace is not None):
                 if compute_warp == cutlass.Int32(0):
                     if lane_idx == cutlass.Int32(0):
@@ -1607,6 +1623,10 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                         cute.arch.store(green_trace.iterator + trace_word(trace_role, cta_linear_id, FIELD_STORE_NS), k2_trace_store_ns, scope='gpu')
         lane_idx = cute.arch.lane_idx()
         self.token_comm_hook_kernel_tail(token_comm_args, warp_idx=warp_idx, lane_idx=lane_idx, tidx=tidx)
+        if cutlass.const_expr(_ps.ENABLED):
+            if warp_idx == cutlass.Int32(0):
+                if lane_idx == cutlass.Int32(0):
+                    _ps.stamp('k2_exit', read_globaltimer())
         if cutlass.const_expr(green_trace is not None):
             if warp_idx == cutlass.Int32(0):
                 if lane_idx == cutlass.Int32(0):

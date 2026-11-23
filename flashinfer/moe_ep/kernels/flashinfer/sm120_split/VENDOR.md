@@ -1,8 +1,8 @@
 # SM120 W4A8 Split Kernel Drop
 
 This directory contains the SM120 MXFP4/MXFP8 split implementation at commit
-`8f3d199e36220c1f26c0501d6ea01c4a5e98daed` (previous drop:
-`6aa25a07fe14afcf0c05323139551cd0533c07b0`).
+`29e39e98324dde862e11a40012a789a52f0c5f4f` (previous drop:
+`8f3d199e36220c1f26c0501d6ea01c4a5e98daed`).
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
 contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
@@ -10,6 +10,27 @@ The FI adapter is `flashinfer/moe_ep/shims/sm120/split_cutedsl/`.
 Backends use its package exports rather than raw modules.
 
 ## Changes since the previous drop
+
+- Push dispatch (`MegaMoEKernelConfig.push_dispatch`, heuristic default on
+  for `p2p_direct` worlds up to 64 tokens per rank, knob `push_dispatch`):
+  right after the reset barrier each source K1 writes the rows routed to a
+  same-NUMA peer into that peer's local shadow of its inputs, and the owner
+  pulls locally instead of with PCIe peer reads. The shim allocates the
+  shadows (`world * stride` bytes directly after the staged input span) and
+  sets `token_comm.push` per bucket.
+- `p2p_split`: the cross-NUMA forwarder joins the compute graph after the K2
+  finalizer (`MEGA_SPLIT_LATE_FORWARDER_JOIN=0` restores the old order).
+- Opt-in `MEGA_SPLIT_FUSED_RESET=1` (graph-owned reset as one fill kernel,
+  `runtime/fused_fill.py`; the shim honours it) and
+  `MEGA_SPLIT_FENCED_PUBLISH=1`; diagnostics `MEGA_SPLIT_PHASE_STAMPS=1`
+  (`phase_stamps.py`; the slots are filled but only the standalone runner
+  prints them) and `MEGA_SPLIT_DIAG_JITTER_US`. `KERNEL_CACHE_ABI=44`.
+- Standalone measurements (host .16, DSv4.1-Flash, p50 us, 8f3d199 ->
+  29e39e9): EP4 T16/32/64/128 1187.8/1450.7/1652.8/1666.2 ->
+  1176.0/1402.7/1638.9/1665.2; EP8 862.7/935.4/987.9/1083.1 ->
+  833.5/923.6/956.4/1079.3.
+
+## Changes in the previous drop (8f3d199)
 
 - NVSHMEM is removed. P2P buffers live in NCCL symmetric windows created
   through the NCCL 2.30.7 device API (`transport/nccl/`): a small host bridge

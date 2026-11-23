@@ -81,6 +81,35 @@ ready-work granularity is N32, N64, or N128 according to the tile heuristic,
 not a fixed 64 tokens. DP and model names are deliberately absent from the
 selector; identical EP shape and topology produce the same specialization.
 
+PCIe peer *reads* are slow on these hosts (a pulled row took 15--30 us under
+load), so decode sizes use push dispatch (`MegaMoEKernelConfig.push_dispatch`,
+on for `p2p_direct` worlds up to `heuristic.PUSH_DISPATCH_MAX_TOKENS` tokens
+per rank). Right after the reset barrier every source K1 writes the
+activation, scale and top-k weight rows of each token routed to a same-NUMA
+peer into that peer's local shadow of the source's inputs (posted 8-byte peer
+stores), and the owner's token-strided pull then reads its shadows instead of
+the peers. The reset barrier orders a source's writes after the owner's pull
+of the previous call; the dispatch barrier orders them before this call's
+pull. Callers allocate the shadows: `world * stride` symmetric bytes placed
+directly after the input span (activation, scales, top-k ids, top-k weights,
+each page-aligned), where `stride` is that span's size, so source `s`'s
+shadow starts at `activation + (s + 1) * stride` on every rank; then set
+`k1.token_comm.push = PushDispatchConfig(stride, peers, peer_mask)` before
+compiling K1 (`peers`: the same-NUMA ranks of the dispatch barrier).
+For `p2p_split` the cross-NUMA forwarder joins the compute graph after the
+K2 finalizer, so the finalizer's same-NUMA barrier no longer waits for the
+slowest rank's last cross-NUMA return (`MEGA_SPLIT_LATE_FORWARDER_JOIN=0`
+restores the old order).
+
+Opt-in, below the 1 % bar for a default: `MEGA_SPLIT_FUSED_RESET=1` issues the
+graph-owned replay reset as one fill kernel instead of a chain of fill nodes,
+and `MEGA_SPLIT_FENCED_PUBLISH=1` publishes a K1 ready tile with one fence
+and relaxed stores. Diagnostics: `MEGA_SPLIT_PHASE_STAMPS=1` records per-call
+`%globaltimer` phase stamps (sender, K1 barriers/push/pull, K2, forwarder,
+scatter) that the runner prints after a `--pr_timing` run, and
+`MEGA_SPLIT_DIAG_JITTER_US=N` injects per-call 0..N us delays in K1 before the
+reset barrier and before the pull to exercise cross-rank buffer reuse.
+
 The regular K2 path uses the compact eight-warp CTA: four compute warps, two
 TMA producer warps, one scheduler warp, and one FC2-ready auxiliary warp. The
 small decode heuristic selects the 12-warp dual-N8 path, where two compute

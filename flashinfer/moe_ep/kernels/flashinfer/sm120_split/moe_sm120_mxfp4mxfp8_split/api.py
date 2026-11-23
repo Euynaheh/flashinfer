@@ -44,7 +44,9 @@ from .jit_config import Sm120JitConfig
 # included in the immutable kernel configuration and therefore the cache key.
 # ABI41: explicit joint FC1/FC2 weight TMA cache policy, including tail drain.
 # ABI42: widen FC2 workspace row indices after direct-stage mapping.
-KERNEL_CACHE_ABI = 43
+# ABI44: push dispatch (same-NUMA input shadows, MegaMoEKernelConfig.push_dispatch)
+# and one fence per published K1 ready tile.
+KERNEL_CACHE_ABI = 44
 
 
 @dataclass(frozen=True)

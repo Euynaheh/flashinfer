@@ -146,6 +146,15 @@ def _scale_sm_partition(
 # per SM (k1_ctas_per_sm=2, k2_launch_factor=2) were found bit-exact.
 RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT = 32.0
 
+# Push dispatch (``MegaMoEKernelConfig.push_dispatch``): each source writes the
+# rows routed to a same-NUMA peer into a local shadow on that peer, so K1 pulls
+# from local memory instead of issuing PCIe P2P reads (which take tens of us
+# per row on RTX Pro 5000 hosts). Costs one input span per EP rank of
+# symmetric memory; on by default up to this many tokens per rank (DSv4.1
+# EP4/EP8 ABBA: -1.1 to -3.7 % at 16-64 tokens, +1.1 to +2.6 % at 128, where
+# pushing every routed row costs more than the slower pull).
+PUSH_DISPATCH_MAX_TOKENS = 64
+
 
 @dataclass(frozen=True)
 class MegaMoEHeuristicInput:
@@ -324,6 +333,8 @@ class MegaMoEHeuristicOverrides:
     k1_stages: Optional[int] = None
     k2_launch_factor: Optional[int] = None
     weight_prefetch_ahead: Optional[int] = None
+    # Push dispatch (None: on for p2p_direct up to PUSH_DISPATCH_MAX_TOKENS).
+    push_dispatch: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -387,6 +398,9 @@ class MegaMoEKernelConfig:
     k2_launch_factor: int = 1
     # K tiles ahead for the K1/K2 weight-producer L2 prefetch (0 = off).
     weight_prefetch_ahead: int = 0
+    # Sources push the routed input rows into same-NUMA owners' local shadows
+    # (p2p_direct kernel transport only; the caller allocates the shadows).
+    push_dispatch: bool = False
 
     def __post_init__(self):
         if self.weight_prefetch_ahead not in (0, 4, 8):
@@ -418,6 +432,9 @@ class MegaMoEKernelConfig:
             raise ValueError("k2_launch_factor=2 needs a K2 tile with N <= 32 (two CTAs per SM)")
         if self.activation_eviction_policy not in ("default", "evict_last"):
             raise ValueError("activation_eviction_policy must be default or evict_last")
+        if self.push_dispatch and (self.kernel_comm_backend != "p2p_direct"
+                                   or self.dispatch_pull_mode != "token_strided"):
+            raise ValueError("push_dispatch needs the p2p_direct kernel transport and the token-strided pull")
         if self.weight_eviction_policy not in ("default", "evict_first"):
             raise ValueError("weight_eviction_policy must be default or evict_first")
 
@@ -960,7 +977,7 @@ def _with_tuned_table(shape, overrides):
     anchor = replace(shape, tokens_per_rank=int(entry["tokens"]))
     measured, _ = _select_config_and_dispatch_base(
         anchor, MegaMoEHeuristicOverrides(**{k: v for k, v in table.items()
-                                             if k != "weight_eviction_policy"}))
+                                             if k not in ("weight_eviction_policy", "push_dispatch")}))
     merged = {name: getattr(measured, name) for name in _PINNED_FROM_ANCHOR}
     merged.update(table)
     if shape.expected_rows_per_expert > RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT:
@@ -1138,7 +1155,9 @@ def select_config_and_dispatch(shape, overrides=None, *, use_tuned_defaults=True
     activation_explicit = overrides.activation_eviction_policy if overrides is not None else None
     if activation_explicit not in (None, "default", "evict_last"):
         raise ValueError("activation_eviction_policy must be default or evict_last")
-    geometry_overrides = (replace(overrides, weight_eviction_policy=None, activation_eviction_policy=None)
+    push_explicit = overrides.push_dispatch if overrides is not None else None
+    geometry_overrides = (replace(overrides, weight_eviction_policy=None, activation_eviction_policy=None,
+                                  push_dispatch=None)
                           if overrides is not None else None)
     config, dispatch = _select_config_and_dispatch_base(
         shape, geometry_overrides, use_tuned_defaults=use_tuned_defaults)
@@ -1149,8 +1168,20 @@ def select_config_and_dispatch(shape, overrides=None, *, use_tuned_defaults=True
     activation_policy = (activation_explicit if activation_explicit is not None else
         _select_weight_cache_policy(shape, config, activation=True)
         if use_tuned_defaults else "default")
+    push = push_explicit if push_explicit is not None else _select_push_dispatch(shape, config)
     return replace(config, weight_eviction_policy=policy,
-                   activation_eviction_policy=activation_policy), dispatch
+                   activation_eviction_policy=activation_policy, push_dispatch=push), dispatch
+
+
+def _select_push_dispatch(shape, config) -> bool:
+    """Default push dispatch: decode-size p2p_direct worlds with peers."""
+    return bool(
+        config.kernel_comm_backend == "p2p_direct"
+        and config.dispatch_pull_mode == "token_strided"
+        and shape.expert_parallel_size > 1
+        and shape.ep_same_numa_peer_count > 0
+        and shape.tokens_per_rank <= PUSH_DISPATCH_MAX_TOKENS
+    )
 
 
 def select_megamoe_config(shape, overrides=None, *, use_tuned_defaults=True):

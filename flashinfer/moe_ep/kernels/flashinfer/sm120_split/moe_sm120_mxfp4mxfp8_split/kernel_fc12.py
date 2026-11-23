@@ -78,6 +78,7 @@ from .split_timestamp import (
     read_globaltimer,
     trace_word,
 )
+from . import phase_stamps as _ps
 from common.moe_utils import (
     cvt_f32_to_f8_to_f32,
     cvt_f32x4_to_f8x4_pack_i32,
@@ -3064,6 +3065,12 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
             trace_role = ROLE_K2
         if cutlass.const_expr(self.green_trace_role is not None):
             trace_role = self.green_trace_role
+        if cutlass.const_expr(_ps.ENABLED and self.scheduler_phase_mode == "fc1"):
+            if warp_idx == cutlass.Int32(0):
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    _ps_now = read_globaltimer()
+                    _ps.stamp("k1_entry", _ps_now)
+                    _ps.stamp("k1_entry_last", _ps_now)
         if cutlass.const_expr(green_trace is not None):
             if warp_idx == cutlass.Int32(0):
                 if cute.arch.lane_idx() == cutlass.Int32(0):
@@ -4814,6 +4821,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
             fc1_detail_tiles_seen = cutlass.Int32(0)
             fc2_detail_tiles_seen = cutlass.Int32(0)
             green_trace_seen_work = cutlass.Int32(0)
+            ps_seen_work = cutlass.Int32(0)
             k2_trace_tile_count = cutlass.Int64(0)
             k2_trace_first_tile_id = cutlass.Int64(0)
             k2_trace_last_tile_id = cutlass.Int64(0)
@@ -4827,6 +4835,14 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
             k2_trace_store_ns = cutlass.Int64(0)
 
             while work_tile_info.is_valid_tile:
+                if cutlass.const_expr(_ps.ENABLED and self.scheduler_phase_mode == "fc1"):
+                    if compute_warp == cutlass.Int32(0):
+                        if lane_idx == cutlass.Int32(0):
+                            if ps_seen_work == cutlass.Int32(0):
+                                _ps_now = read_globaltimer()
+                                _ps.stamp("k1_first_tile", _ps_now)
+                                _ps.stamp("k1_first_tile_last", _ps_now)
+                                ps_seen_work = cutlass.Int32(1)
                 if cutlass.const_expr(green_trace is not None):
                     if compute_warp == cutlass.Int32(0):
                         if lane_idx == cutlass.Int32(0):
@@ -6440,6 +6456,10 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
             lane_idx=lane_idx,
             tidx=tidx,
         )
+        if cutlass.const_expr(_ps.ENABLED and self.scheduler_phase_mode == "fc1"):
+            if warp_idx == cutlass.Int32(0):
+                if lane_idx == cutlass.Int32(0):
+                    _ps.stamp("k1_exit", read_globaltimer())
         if cutlass.const_expr(green_trace is not None):
             if warp_idx == cutlass.Int32(0):
                 if lane_idx == cutlass.Int32(0):

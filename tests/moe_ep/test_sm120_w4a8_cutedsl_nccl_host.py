@@ -359,3 +359,33 @@ def test_local_topology_is_single_numa() -> None:
         select_comm_backend(_config(DSV41, rank=0, world_size=1), topology)
         == "p2p_direct"
     )
+
+
+@pytest.mark.parametrize("model", (DSV41, GLM53), ids=("dsv41", "glm53"))
+def test_push_dispatch_follows_decode_buckets(model) -> None:
+    from moe_sm120_mxfp4mxfp8_split.heuristic import PUSH_DISPATCH_MAX_TOKENS
+
+    for tokens in (16, 32, 64, 128):
+        expected = tokens <= PUSH_DISPATCH_MAX_TOKENS
+        assert (
+            _spec(
+                model, tokens, ep=4, same=3, cross=0, split=False
+            ).kernel.push_dispatch
+            == expected
+        )
+        split = _spec(model, tokens, ep=8, same=7, cross=0, split=True)
+        assert split.kernel.push_dispatch == expected
+
+
+def test_push_shadow_stride_covers_the_staged_inputs() -> None:
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import runtime as shim_runtime
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl.comm import page_bytes
+
+    config = _config(DSV41, rank=0, world_size=4)
+    shapes = shim_runtime._input_shapes(config)
+    span = sum(
+        page_bytes(n * d.itemsize) for n, d in ((s[0] * s[1], d) for s, d in shapes[:4])
+    )
+    assert shim_runtime._push_stride(config) == span
+    # The output buffer stays outside the pushed span.
+    assert len(shapes) == 5

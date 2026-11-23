@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import torch
+
+# p2p_split: join the cross-NUMA forwarder after the K2 finalizer instead of
+# before it (MEGA_SPLIT_LATE_FORWARDER_JOIN=0 restores the old order).
+_LATE_FORWARDER_JOIN = os.environ.get("MEGA_SPLIT_LATE_FORWARDER_JOIN", "1") != "0"
 
 
 def _check_cuda(result: tuple[Any, ...], operation: str) -> tuple[Any, ...]:
@@ -421,7 +426,7 @@ class NativeGreenContextGraph:
                 # Same G1 stream: the drain worker begins only after K1 has
                 # released its SM partition.
                 launch_k2_drain()
-            if forwarder_done is not None:
+            if forwarder_done is not None and not _LATE_FORWARDER_JOIN:
                 k1_stream.wait_event(forwarder_done)
             if streaming_k3 and launch_k3 is not None:
                 # Per-row ready flags allow K3 to consume completed source
@@ -442,6 +447,12 @@ class NativeGreenContextGraph:
                 # This one-CTA node reuses the original rank barrier/reset
                 # after both shared-queue consumers have drained.
                 launch_k2_finalizer()
+            if forwarder_done is not None and _LATE_FORWARDER_JOIN:
+                # p2p_split: the forwarder only reads K2 progress, the K1
+                # totals snapshot and the shadow rows, none of which the
+                # finalizer resets, so the finalizer's same-NUMA barrier does
+                # not wait for the slowest rank's last cross-NUMA return.
+                root_stream.wait_event(forwarder_done)
             # Non-streaming K3 joins after the mixed-context graph.
             # Completion below includes it, preserving caller reset ordering.
             (graph,) = _check_cuda(

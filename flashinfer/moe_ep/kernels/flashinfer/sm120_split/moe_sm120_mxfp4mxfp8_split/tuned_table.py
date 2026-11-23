@@ -137,7 +137,7 @@ def overrides_for(knobs: dict) -> dict:
         out["k2_warps"] = int(knobs["k2_warps"])
     if knobs.get("k2_ready_queue_bundle") is not None:
         out["ready_queue_bundle"] = int(knobs["k2_ready_queue_bundle"])
-    for key in ("k2_tail_reclaim", "fc1_utility_postprocess"):
+    for key in ("k2_tail_reclaim", "fc1_utility_postprocess", "push_dispatch"):
         if knobs.get(key) is not None:
             out[key] = knobs[key] == "on"
     if knobs.get("weight_eviction_policy") is not None:

@@ -201,6 +201,14 @@ class XnumaTransport:
         QUIET_EVERY = max(1, int(os.environ.get("MEGAMOE_XNUMA_QUIET_EVERY", "32")))
         FUSED_COMMIT = os.environ.get("MEGAMOE_XNUMA_FUSED_COMMIT", "1") != "0"
         TOPK_ADDR = int(self.tester.my_topk_idx.data_ptr())
+        from .. import phase_stamps as _ps
+        from ..split_timestamp import read_globaltimer as _gt
+
+        @cute.jit
+        def pstamp(tid, name: cutlass.Constexpr):
+            if cutlass.const_expr(_ps.ENABLED):
+                if tid == Int32(0):
+                    _ps.stamp(name, _gt())
         CO = self.combine_addr
         CH = (T * TOPK + 127) // 128  # sender: routes per thread
         ROW8 = ROW // 8
@@ -265,6 +273,7 @@ class XnumaTransport:
             tid, _, _ = cute.arch.thread_idx()
             j = Int32(j)
             owner = Int32(tbl(j, 0))
+            pstamp(tid, "sender_in")
             epoch = cute.arch.load(ptr(Int64, Int64(EPOCH), 8), Int64, sem="acquire", scope="gpu")
             # Retire earlier calls' puts from this CTA's GIN slot (deferred
             # flush: by the time a call returns, every owner consumed them, so
@@ -353,6 +362,7 @@ class XnumaTransport:
                     cute.make_tensor(ptr(Int64, word, 8), cute.make_layout(1)),
                     owner,
                 )
+            pstamp(tid, "sender_out")
 
         @cute.jit
         def sender(stream: cuda.CUstream):
@@ -440,6 +450,7 @@ class XnumaTransport:
                 cute.make_tensor(ptr(Int64, word, 8), cute.make_layout(1)),
                 source,
             )
+            pstamp(tid, "fwd_out")
 
         @cute.jit
         def forwarder(stream: cuda.CUstream):
@@ -451,9 +462,11 @@ class XnumaTransport:
             tid, _, _ = cute.arch.thread_idx()
             j = Int32(b) // Int32(4)
             q4 = Int32(b) % Int32(4)
+            pstamp(tid, "scatter_in")
             epoch = cute.arch.load(ptr(Int64, Int64(EPOCH), 8), Int64, sem="acquire", scope="gpu")
             if tid == Int32(0):
                 gin.wait_owner_signal(rx, ptr(Int64, Int64(A["done"]) + Int64(j) * Int64(8), 8), Int64(FS) * epoch)
+            pstamp(tid, "scatter_wait")
             cute.arch.barrier(barrier_id=0, number_of_threads=128)
             cute.arch.fence_acq_rel_sys()
             rec = cute.make_tensor(ptr(Int32, Int64(A["txrec"]) + Int64(j) * Int64(REC_B), 4), cute.make_layout(REC_I32))
@@ -471,6 +484,7 @@ class XnumaTransport:
                     k = k + Int32(4)
             cute.arch.fence_acq_rel_gpu()
             cute.arch.barrier(barrier_id=0, number_of_threads=128)
+            pstamp(tid, "scatter_out")
 
         @cute.jit
         def scatter(stream: cuda.CUstream):

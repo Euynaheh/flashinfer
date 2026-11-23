@@ -625,6 +625,18 @@ class MegaMoESm120W4A8Frontend:
                     and getattr(kernel, "token_comm", None) is not None
                 ):
                     kernel.token_comm.barrier_peer_mask = same_numa_mask
+        if spec.kernel.push_dispatch and self.config.world_size > 1 and not _no_dist():
+            from moe_sm120_mxfp4mxfp8_split.token_comm import PushDispatchConfig
+
+            # Sources push routed input rows into a local shadow on each
+            # same-NUMA peer (allocated right after the staged inputs).
+            token_comm = bundle.k1.token_comm
+            mask = token_comm.barrier_peer_mask & ~(1 << self.config.rank)
+            peers = tuple(r for r in range(self.config.world_size) if (mask >> r) & 1)
+            if peers:
+                token_comm.push = PushDispatchConfig(
+                    stride=_push_stride(self.config), peers=peers, peer_mask=mask
+                )
         plan = (spec, bundle)
         self.workspace._execution_plans[bucket] = plan
         return plan
@@ -930,6 +942,17 @@ class MegaMoESm120W4A8Frontend:
             spec.kernel.k2_tail_reclaim or finalizer_executor is not None
         )
         all_kernels_ready = time.monotonic()
+        from moe_sm120_mxfp4mxfp8_split.runtime import fused_fill
+
+        fused_reset = fused_fill.enabled()
+        if graph_owns_epoch_reset and fused_reset:
+            # Compile the fused reset outside the capture (the same reset
+            # every replay starts with).
+            with torch.cuda.stream(root_stream):
+                self._reset_execution(
+                    execution, reset_dispatch_rank_cache=False, fused=True
+                )
+            torch.cuda.synchronize()
         graph = NativeGreenContextGraph.capture(
             root_stream=root_stream,
             k1_stream=k1_stream,
@@ -971,7 +994,7 @@ class MegaMoESm120W4A8Frontend:
             launch_reset=(
                 (
                     lambda: self._reset_execution(
-                        execution, reset_dispatch_rank_cache=False
+                        execution, reset_dispatch_rank_cache=False, fused=fused_reset
                     )
                 )
                 if graph_owns_epoch_reset
@@ -1021,7 +1044,11 @@ class MegaMoESm120W4A8Frontend:
         execution: _ExecutionBuffers,
         *,
         reset_dispatch_rank_cache: bool = True,
+        fused: bool = False,
     ) -> None:
+        # fused=True (graph-owned reset, opt-in MEGA_SPLIT_FUSED_RESET=1): one
+        # fill kernel instead of a chain of per-region fill nodes in front of K1.
+        fills: list[tuple[torch.Tensor, int]] = []
         kernel = execution.bundle.k1
         reset_regions = list(self._LOCAL_RESET_REGIONS)
         if reset_dispatch_rank_cache:
@@ -1031,22 +1058,34 @@ class MegaMoESm120W4A8Frontend:
                 continue
             offset = int(kernel._local_offsets[name])
             size = int(kernel._local_region_by_name[name].nbytes)
-            execution.local_workspace[offset : offset + size].zero_()
+            fills.append((execution.local_workspace[offset : offset + size], 0))
         if "rank_combine_route_map" in kernel._local_offsets:
             name = "rank_combine_route_map"
             offset = int(kernel._local_offsets[name])
             size = int(kernel._local_region_by_name[name].nbytes)
-            execution.local_workspace[offset : offset + size].view(torch.int32).fill_(
-                -1
+            fills.append(
+                (
+                    execution.local_workspace[offset : offset + size].view(torch.int32),
+                    -1,
+                )
             )
         if execution.rank_combine_ready is not None:
             self._rank_combine_epoch += 1
-            execution.rank_combine_ready[-1, 0].fill_(self._rank_combine_epoch)
+            fills.append(
+                (execution.rank_combine_ready[-1, 0], self._rank_combine_epoch)
+            )
         # The graph finalizer owns peer-written expert_recv_count and its
         # published sum. It clears both between two rank barriers; clearing
         # either here can erase an early peer's next-epoch dispatch write.
         if execution.green_trace is not None:
-            execution.green_trace.zero_()
+            fills.append((execution.green_trace, 0))
+        if fused:
+            from moe_sm120_mxfp4mxfp8_split.runtime.fused_fill import launch_fused_fill
+
+            launch_fused_fill(fills, torch.cuda.current_stream())
+        else:
+            for tensor, value in fills:
+                tensor.fill_(value)
 
     def run(self, inputs: MegaMoESm120W4A8Inputs) -> torch.Tensor:
         compiled = self._ensure_compiled(inputs)
@@ -1097,6 +1136,16 @@ def _input_shapes(config: MegaMoESm120W4A8Config) -> tuple:
         ((capacity, config.num_topk), torch.int64),
         ((capacity, config.num_topk), torch.float32),
         ((capacity, config.hidden), torch.bfloat16),
+    )
+
+
+def _push_stride(config: MegaMoESm120W4A8Config) -> int:
+    """Arena bytes of the staged input span (activation .. top-k weights):
+    the push-dispatch shadow of source ``s`` starts ``(s + 1) * stride`` after
+    the activation buffer."""
+    return sum(
+        page_bytes(math.prod(shape) * dtype.itemsize)
+        for shape, dtype in _input_shapes(config)[:4]
     )
 
 
@@ -1166,6 +1215,7 @@ def allocate_workspace(
     session = None
     buckets = workspace_compile_buckets(config.max_tokens_per_rank)
     plans = {}
+    push_dispatch = False
     if multi_rank:
         sizes = [
             math.prod(shape) * dtype.itemsize for shape, dtype in _input_shapes(config)
@@ -1177,6 +1227,12 @@ def allocate_workspace(
             spec, bundle = frontend._ensure_plan(bucket)
             plans[bucket] = (spec, bundle)
             sizes += _bucket_buffer_bytes(config, bucket, spec, bundle)
+        push_dispatch = any(
+            getattr(bundle.k1.token_comm, "push", None) is not None
+            for _, bundle in plans.values()
+        )
+        if push_dispatch:
+            sizes.append(config.world_size * _push_stride(config))
         shadow = None
         reserved_bytes = 0
         if comm_backend == "p2p_split":
@@ -1209,12 +1265,27 @@ def allocate_workspace(
     try:
         roots: list[torch.Tensor] = []
         views = []
-        for shape, dtype in _input_shapes(config):
+        push_shadow = None
+        for index, (shape, dtype) in enumerate(_input_shapes(config)):
+            if index == 4 and push_dispatch:
+                # Push dispatch: one shadow input span per EP rank, written by
+                # that rank's K1, right after this rank's own span.
+                push_shadow = sym_zeros(
+                    (config.world_size * _push_stride(config),),
+                    torch.uint8,
+                    session=session,
+                )
+                roots.append(push_shadow)
             view, root = sym_byte_view(shape, dtype, session=session)
             views.append(view)
             roots.append(root)
         workspace.x, workspace.x_scale, workspace.topk_ids = views[:3]
         workspace.topk_weights, workspace.output = views[3:]
+        if push_shadow is not None and (
+            int(push_shadow.data_ptr()) - int(workspace.x.data_ptr())
+            != _push_stride(config)
+        ):
+            raise RuntimeError("push-dispatch shadow must follow the staged inputs")
         workspace.topk_ids.fill_(-1)
         for bucket, (spec, bundle) in plans.items():
             workspace._symmetric_buffers[bucket] = _allocate_bucket_buffers(
