@@ -1,8 +1,8 @@
 # SM120 W4A8 Split Kernel Drop
 
 This directory contains the SM120 MXFP4/MXFP8 split implementation at commit
-`29e39e98324dde862e11a40012a789a52f0c5f4f` (previous drop:
-`8f3d199e36220c1f26c0501d6ea01c4a5e98daed`).
+`7211ca9cd83355d404e9d4fa5b74bba5bf659369` (previous drop:
+`29e39e98324dde862e11a40012a789a52f0c5f4f`).
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
 contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
@@ -10,6 +10,23 @@ The FI adapter is `flashinfer/moe_ep/shims/sm120/split_cutedsl/`.
 Backends use its package exports rather than raw modules.
 
 ## Changes since the previous drop
+
+- Packed `p2p_split` dispatch for EP16 (`XnumaLayout.pack`,
+  `heuristic.select_xnuma_pack`: EP16 from 32 tokens per rank; EP8 and
+  smaller worlds keep the span put): the standalone sender puts each cross
+  owner only the rows routed to it plus a token -> row map, and the K1
+  token-strided pull reads the map for cross sources. FlashInfer does not run
+  EP16, so the shim never sets `pack` (the K1 hook reads it with `getattr`,
+  and the non-pack paths compile unchanged); the sender part lives only in the
+  standalone `transport/xnuma.py` (see FlashInfer adaptations).
+- `transport/xnuma_layout.py` accepts forwarder splits 1, 2 or 4 and the
+  forwarder handles any split (default 2, unchanged).
+- Standalone EP16 measurements (two hosts, p50 us, 29e39e9 -> 7211ca9):
+  DSv4.1-Flash T32/64/128/256 640.0/744.4/959.7/1475.6 ->
+  621.6/684.0/850.4/1253.4; GLM5.3-Flash 441.3/544.8/696.3/1151.5 ->
+  427.0/501.2/624.6/1004.5; T16 unchanged.
+
+## Changes in the previous drop (29e39e9)
 
 - Push dispatch (`MegaMoEKernelConfig.push_dispatch`, heuristic default on
   for `p2p_direct` worlds up to 64 tokens per rank, knob `push_dispatch`):
@@ -81,7 +98,9 @@ These are preserved when applying upstream kernel changes:
   view to the heuristic so that the `ep8_2numa` anchor entries apply.
 - `transport/xnuma.py` accepts a shared control-region layout, a shared
   device epoch and per-input put regions, so one workspace serves every
-  compile bucket from one reserved region. `transport/nccl/device.bind`
+  compile bucket from one reserved region. It keeps those span puts: the
+  standalone packed EP16 dispatch (`XnumaLayout.pack`) is not ported, and
+  `XnumaK1Config` has no `pack` field (the K1 hook treats it as off). `transport/nccl/device.bind`
   accepts the owning session instead of the process-global session.
 - `transport/nccl/runtime.py` tries roots registered in `PREFERRED_ROOTS`
   first (the adapter registers FlashInfer's NCCL discovery: `NCCL_HOME`, then

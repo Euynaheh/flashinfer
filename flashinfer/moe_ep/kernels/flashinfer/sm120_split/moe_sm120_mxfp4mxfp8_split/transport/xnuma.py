@@ -19,7 +19,7 @@ shadows in sync with GIN:
                  commits, and persistent K1/K2 CTAs can otherwise occupy every
                  SM before an unordered sender is scheduled.
 * ``forwarder`` (forked after K1 inside the compute graph, beside K2): per
-                 cross source, ``fsplit`` CTAs (experts split by parity) poll the
+                 cross source, ``fsplit`` CTAs (experts split by id modulo fsplit) poll the
                  K2 per-expert progress counters; each newly completed expert's
                  rows are packed in completion order (16 B header + row) and
                  sent with one contiguous put to the source's return region;
@@ -391,9 +391,9 @@ class XnumaTransport:
             stage = Int64(A["stage"]) + Int64(b) * Int64(STRIDE)
             ret_base = tbl(j, 5) + Int64(h) * Int64(STRIDE)
             sent = Int64(half_masks[0])
-            if cutlass.const_expr(FS == 2):
-                if h == Int32(1):
-                    sent = Int64(half_masks[1])
+            for hh in cutlass.range_constexpr(1, FS):
+                if h == Int32(hh):
+                    sent = Int64(half_masks[hh])
             go = Int32(1)
             wpos = Int32(0)
             while go == Int32(1):

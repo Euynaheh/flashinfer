@@ -1117,11 +1117,45 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     inp_tok_local_base = input_token_buffer.iterator.toint()
                     inp_sf_local_base = input_sf_buffer.iterator.toint()
                     inp_w_local_base = input_topk_weights_buffer.iterator.toint()
-                    tma_src_addr = (
-                        inp_tok_local_base
-                        + cur_peer_offset
-                        + Int64(src_token * Int32(self.hidden_bytes))
-                    )
+                    _xpack = self.xnuma is not None and getattr(self.xnuma, "pack", False)
+                    if cutlass.const_expr(_xpack):
+                        # Packed cross-NUMA dispatch: the source shadow holds
+                        # only its rows routed here (see XnumaK1Config.pack).
+                        row_tok = src_token
+                        sf_row_addr = (
+                            inp_sf_local_base
+                            + cur_peer_offset
+                            + Int64(src_token * Int32(self.sf_uint32_per_token * 4))
+                        )
+                        w_row_addr = (
+                            inp_w_local_base
+                            + cur_peer_offset
+                            + Int64(src_token * Int32(self.num_topk * 4))
+                        )
+                        if (Int64(self.xnuma.cross_mask) >> Int64(current_rank_in_expert_idx)) & Int64(1) == Int64(1):
+                            pack_small = inp_sf_local_base + cur_peer_offset
+                            row_tok = ldg_b32_raw(pack_small + Int64(src_token * Int32(4)))
+                            w_row_addr = (
+                                pack_small
+                                + Int64(self.xnuma.tokens_per_rank * 4)
+                                + Int64(row_tok * Int32(self.num_topk * 4))
+                            )
+                            sf_row_addr = (
+                                pack_small
+                                + Int64(self.xnuma.tokens_per_rank * 4 * (1 + self.num_topk))
+                                + Int64(row_tok * Int32(self.sf_uint32_per_token * 4))
+                            )
+                        tma_src_addr = (
+                            inp_tok_local_base
+                            + cur_peer_offset
+                            + Int64(row_tok * Int32(self.hidden_bytes))
+                        )
+                    else:
+                        tma_src_addr = (
+                            inp_tok_local_base
+                            + cur_peer_offset
+                            + Int64(src_token * Int32(self.hidden_bytes))
+                        )
                     if cache_old > Int32(0):
                         tma_src_addr = (
                             fc1_input_token_buffer.iterator.toint()
@@ -1159,32 +1193,38 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                                     + Int64(cached_sf_pos) * Int64(4)
                                 )
                             else:
-                                sf_addr = (
-                                    inp_sf_local_base
-                                    + cur_peer_offset
-                                    + Int64(
-                                        (
-                                            src_token
-                                            * Int32(self.sf_uint32_per_token)
-                                            + j
+                                if cutlass.const_expr(_xpack):
+                                    sf_addr = sf_row_addr + Int64(j * Int32(4))
+                                else:
+                                    sf_addr = (
+                                        inp_sf_local_base
+                                        + cur_peer_offset
+                                        + Int64(
+                                            (
+                                                src_token
+                                                * Int32(self.sf_uint32_per_token)
+                                                + j
+                                            )
+                                            * Int32(4)
                                         )
-                                        * Int32(4)
                                     )
-                                )
                                 sf_value = ldg_b32_raw(sf_addr)
                             sf_vals[i] = sf_value
                     if lane_idx == Int32(0):
-                        weight_addr = (
-                            inp_w_local_base
-                            + cur_peer_offset
-                            + Int64(
-                                (
-                                    src_token * Int32(self.num_topk)
-                                    + src_topk
+                        if cutlass.const_expr(_xpack):
+                            weight_addr = w_row_addr + Int64(src_topk * Int32(4))
+                        else:
+                            weight_addr = (
+                                inp_w_local_base
+                                + cur_peer_offset
+                                + Int64(
+                                    (
+                                        src_token * Int32(self.num_topk)
+                                        + src_topk
+                                    )
+                                    * Int32(4)
                                 )
-                                * Int32(4)
                             )
-                        )
                         weight = ldg_f32_raw(weight_addr)
 
                 for i in cutlass.range_constexpr(0, sf_passes, 1):

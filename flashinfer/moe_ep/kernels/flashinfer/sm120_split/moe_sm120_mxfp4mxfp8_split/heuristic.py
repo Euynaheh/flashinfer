@@ -155,6 +155,21 @@ RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT = 32.0
 # pushing every routed row costs more than the slower pull).
 PUSH_DISPATCH_MAX_TOKENS = 64
 
+# Packed p2p_split dispatch (``XnumaLayout.pack``): each source sends a cross
+# owner only the rows routed to it (staged in token order, plus a token ->
+# row map) instead of its whole input span. The span puts are NIC-bandwidth
+# bound (EP16: 12 network peers per rank), while only 1 - (1 - 1/ep)^topk of
+# the tokens reach a given owner. Staging costs the sender (which precedes
+# K1) a few us, so small calls keep the span put. Minimum tokens per rank per
+# EP size; EP sizes not listed never pack.
+XNUMA_PACK_MIN_TOKENS = {16: 32}
+
+
+def select_xnuma_pack(tokens_per_rank: int, expert_parallel_size: int) -> bool:
+    """Default packed p2p_split dispatch for a call size and EP size."""
+    lo = XNUMA_PACK_MIN_TOKENS.get(int(expert_parallel_size))
+    return lo is not None and int(tokens_per_rank) >= lo
+
 
 @dataclass(frozen=True)
 class MegaMoEHeuristicInput:
@@ -1191,6 +1206,8 @@ def select_megamoe_config(shape, overrides=None, *, use_tuned_defaults=True):
 
 
 __all__ = [
+    "XNUMA_PACK_MIN_TOKENS",
+    "select_xnuma_pack",
     "MegaMoEHeuristicInput",
     "MegaMoEHeuristicOverrides",
     "MegaMoEKernelConfig",

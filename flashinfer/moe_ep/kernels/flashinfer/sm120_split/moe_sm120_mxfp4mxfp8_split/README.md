@@ -101,6 +101,25 @@ K2 finalizer, so the finalizer's same-NUMA barrier no longer waits for the
 slowest rank's last cross-NUMA return (`MEGA_SPLIT_LATE_FORWARDER_JOIN=0`
 restores the old order).
 
+`p2p_split` sends its inputs to network (GIN) peers in the sender kernel that
+precedes K1. By default it puts the whole input span to every cross owner,
+which at EP16 (12 network peers per rank) is NIC-bandwidth bound: phase
+stamps show K1 waiting 35--50 us (T=16) to ~400 us (T=256) for the cross
+dispatch while only `1 - (1 - 1/ep)^topk` of the tokens (32 % for top-6,
+40 % for top-8 at EP16) reach a given owner. Packed dispatch
+(`XnumaLayout.pack`; `--xnuma_pack` / `MEGAMOE_XNUMA_PACK=0|1`, default
+`heuristic.select_xnuma_pack`: EP16 from `XNUMA_PACK_MIN_TOKENS[16]` tokens
+per rank) makes each sender CTA find the tokens routed to its owner (a ballot
+scan in token order), copy their activation rows into a staging region
+(`pstage`) and put only those rows, followed by one block holding
+`map[token] -> packed row`, the top-k weights and the scale rows by packed
+row; it lands at the scale base of the owner's shadow-of-source. The owner's
+token-strided pull reads the map for cross sources and addresses the packed
+rows; records, the return path and same-NUMA sources are unchanged. At EP8
+(4 network peers on one host) packing measured neutral to slower and stays
+off. `MEGAMOE_XNUMA_FSPLIT=1|2|4` (diagnostic) sets the forwarder CTAs per
+cross source; 2 (default) measured best at EP16.
+
 Opt-in, below the 1 % bar for a default: `MEGA_SPLIT_FUSED_RESET=1` issues the
 graph-owned replay reset as one fill kernel instead of a chain of fill nodes,
 and `MEGA_SPLIT_FENCED_PUBLISH=1` publishes a K1 ready tile with one fence
