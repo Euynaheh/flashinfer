@@ -1184,8 +1184,33 @@ def select_config_and_dispatch(shape, overrides=None, *, use_tuned_defaults=True
         _select_weight_cache_policy(shape, config, activation=True)
         if use_tuned_defaults else "default")
     push = push_explicit if push_explicit is not None else _select_push_dispatch(shape, config)
-    return replace(config, weight_eviction_policy=policy,
-                   activation_eviction_policy=activation_policy, push_dispatch=push), dispatch
+    config = replace(config, weight_eviction_policy=policy,
+                     activation_eviction_policy=activation_policy, push_dispatch=push)
+    check_launch_safety(shape, config)
+    return config, dispatch
+
+
+def check_launch_safety(shape, config) -> None:
+    """Reject resolved configurations known to hang at the first launch.
+
+    Every table entry, heuristic default and caller override passes through
+    ``select_config_and_dispatch``, so this is the single gate.
+
+    ``k2_launch_factor=2`` with ``k2_tail_reclaim`` off never finishes its
+    first launch with an 8-warp K2 N16 tile: reproduced with p2p_split at
+    EP16 and EP8 T16 and with p2p_direct at EP4 T16 (DSv4.1-Flash, 2026-11);
+    the same knobs with a K2 N32 tile ran at EP4/EP8 T16/T64. Likely the
+    second K2 CTA per SM is not co-resident while the non-reclaim K2 tail
+    waits for the whole grid; not analysed further. Rejected: every such
+    combination with a K2 N16 tile, and for p2p_split (where the hang was
+    first seen) every such combination.
+    """
+    if config.k2_launch_factor == 2 and not config.k2_tail_reclaim and (
+            shape.ep_numa_split or config.k2_tile[1] == 16):
+        what = "p2p_split" if shape.ep_numa_split else "a K2 N16 tile"
+        raise ValueError(
+            f"k2_launch_factor=2 with k2_tail_reclaim off hangs at the first launch with {what}; "
+            "set k2_tail_reclaim=on or k2_launch_factor=1")
 
 
 def _select_push_dispatch(shape, config) -> bool:
@@ -1206,6 +1231,7 @@ def select_megamoe_config(shape, overrides=None, *, use_tuned_defaults=True):
 
 
 __all__ = [
+    "check_launch_safety",
     "XNUMA_PACK_MIN_TOKENS",
     "select_xnuma_pack",
     "MegaMoEHeuristicInput",

@@ -377,6 +377,45 @@ def test_push_dispatch_follows_decode_buckets(model) -> None:
         assert split.kernel.push_dispatch == expected
 
 
+@pytest.mark.parametrize(
+    "ep,same,split", ((8, 7, True), (4, 3, False)), ids=("ep8_split", "ep4")
+)
+def test_launch_guard_rejects_k2_residency_without_tail_reclaim(
+    ep, same, split
+) -> None:
+    # k2_launch_factor=2 without tail reclaim hangs at the first launch with an
+    # 8-warp K2 N16 tile (standalone check_launch_safety).
+    from moe_sm120_mxfp4mxfp8_split.heuristic import MegaMoEHeuristicOverrides
+
+    hidden, intermediate, topk, experts = DSV41
+    kwargs = dict(
+        problem=MegaMoEProblemSpec(
+            tokens_per_rank=16,
+            num_topk=topk,
+            num_total_experts=experts,
+            hidden=hidden,
+            intermediate=2 * intermediate,
+            expert_parallel_size=ep,
+            expert_parallel_rank=0,
+        ),
+        ep_same_numa_peer_count=same,
+        ep_cross_numa_peer_count=0,
+        num_sms=110,
+        sm_min_partition=8,
+        sm_partition_alignment=8,
+        ep_numa_split=split,
+    )
+    bad = MegaMoEHeuristicOverrides(
+        k2_tile=(64, 16, 128), k2_warps=8, k2_launch_factor=2, k2_tail_reclaim=False
+    )
+    with pytest.raises(ValueError, match="k2_tail_reclaim"):
+        select_compile_spec(overrides=bad, **kwargs)
+    ok = select_compile_spec(
+        overrides=dataclasses.replace(bad, k2_tail_reclaim=True), **kwargs
+    )
+    assert (ok.kernel.k2_launch_factor, ok.kernel.k2_tail_reclaim) == (2, True)
+
+
 def test_push_shadow_stride_covers_the_staged_inputs() -> None:
     from flashinfer.moe_ep.shims.sm120.split_cutedsl import runtime as shim_runtime
     from flashinfer.moe_ep.shims.sm120.split_cutedsl.comm import page_bytes

@@ -1,8 +1,8 @@
 # SM120 W4A8 Split Kernel Drop
 
 This directory contains the SM120 MXFP4/MXFP8 split implementation at commit
-`1864b29da454c9129737920814a2d9cd70b18d36` (previous drop:
-`29e39e98324dde862e11a40012a789a52f0c5f4f`).
+`23df1028b1e9f217a6920cf6b830c244fda9ebbf` (previous drop:
+`1864b29da454c9129737920814a2d9cd70b18d36`).
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
 contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
@@ -10,6 +10,16 @@ The FI adapter is `flashinfer/moe_ep/shims/sm120/split_cutedsl/`.
 Backends use its package exports rather than raw modules.
 
 ## Changes since the previous drop
+
+- `heuristic.check_launch_safety` (end of `select_config_and_dispatch`, so it
+  covers heuristic defaults, tuned-table entries and caller overrides) rejects
+  `k2_launch_factor=2` with `k2_tail_reclaim` off for every `p2p_split`
+  configuration and, on any transport, with a K2 N16 tile: that combination
+  hangs at the first launch (standalone, DSv4.1-Flash T16: EP8 `p2p_split` and
+  EP4 `p2p_direct` with an 8-warp K2 N16 tile; the K2 N32 variant ran). No
+  shipped table entry or default is affected.
+
+## Changes in the previous drop (1864b29)
 
 - Packed `p2p_split` dispatch for EP16 (`XnumaLayout.pack`,
   `heuristic.select_xnuma_pack`: EP16 from 32 tokens per rank; EP8 and
