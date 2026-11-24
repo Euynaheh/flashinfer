@@ -29,7 +29,8 @@ Topologies (DP1/TP1):
 
 The table is a performance hint. Explicit overrides always win, and shapes,
 topologies, devices or backends it does not cover fall back to the
-rule-based selector.
+rule-based selector (``rule_backend`` for the cross-NUMA backend,
+``heuristic.generic_decode_knobs`` for decode-size kernel knobs).
 """
 
 from __future__ import annotations
@@ -104,6 +105,12 @@ def nearest_entry(signature: Tuple[int, int, int, int], topology: str, tokens: i
     return None
 
 
+def has_table(signature: Tuple[int, int, int, int], topology: str,
+              device: Tuple[int, int, int] = LEGACY_DEVICE) -> bool:
+    """Whether (signature, topology, device) has a table with anchors."""
+    return nearest_entry(signature, topology, 1, device) is not None
+
+
 def lookup(shape) -> Optional[dict]:
     """The anchor entry for this shape and its effective backend, or None."""
     topology = topology_of(shape)
@@ -121,29 +128,65 @@ def lookup(shape) -> Optional[dict]:
     return entry
 
 
-# Default for a cross-NUMA EP world without a table anchor: p2p_split at every
-# token count. The GIN-ring hybrid transport is never chosen by a rule; only an
-# explicit ``comm_backend`` or a measured (110-SM) table anchor selects it.
 SPLIT_MAX_EXPERTS_PER_RANK = 64  # forwarder completion mask is 64-bit
+
+# Backend rule for a cross-NUMA EP world without an explicit backend and
+# without a table anchor: p2p_split (LSA + cross-NUMA shadow transport) up to
+# SPLIT_RULE_MAX_TOKENS tokens per rank, the GIN-ring hybrid above. Measured
+# on 110-SM RTX PRO 5000 EP8 (default knobs, tables bypassed, cold L2, ABBA
+# p50, hybrid vs p2p_split): dsv41 T512/1024/2048/4096/8192/16384/24576
+# +10/-7/+38/+6/-4/-9/-11 %, glm53 +3/0/0/0/+3/+6/-1 %, DSv4-Flash
+# +4/-6/+9/+8/+9/+11/+4 %; p2p_split wins clearly up to T512 and wins or ties
+# up to T16384 except near T1024, the hybrid helps only from T16384 on
+# (dsv41). The hybrid needs the CUDA 13.1 structured SM split
+# (``runtime.driver_caps``); without it p2p_split serves every size. The
+# hybrid rings are validated on one host only (EP <= 8); EP16 is p2p_split.
+SPLIT_RULE_MAX_TOKENS = 16384
+HYBRID_MAX_EP = 8
+
+
+def hybrid_available(shape) -> bool:
+    """Whether the GIN-ring hybrid can run for this world on this driver."""
+    if shape.expert_parallel_size > HYBRID_MAX_EP:
+        return False
+    from .runtime.driver_caps import hybrid_sm_split_available
+
+    return hybrid_sm_split_available()
+
+
+def rule_backend(shape) -> Optional[str]:
+    """The untabulated cross-NUMA rule: ``p2p_split`` up to
+    ``SPLIT_RULE_MAX_TOKENS`` tokens per rank, ``hybrid`` above when the
+    hybrid can run, else ``p2p_split``; None when neither can serve the world
+    (more than 64 experts per rank and no hybrid)."""
+    split_ok = shape.num_total_experts // shape.expert_parallel_size <= SPLIT_MAX_EXPERTS_PER_RANK
+    if split_ok and shape.tokens_per_rank <= SPLIT_RULE_MAX_TOKENS:
+        return "p2p_split"
+    if hybrid_available(shape):
+        return "hybrid"
+    return "p2p_split" if split_ok else None
 
 
 def preferred_ep8_backend(shape) -> Optional[str]:
     """Backend for a real cross-NUMA EP shape (network peers not yet folded):
     the nearest table anchor's backend (``p2p_split`` or, in the original
-    110-SM EP8 tables, ``hybrid``), else ``p2p_split``. None when the shape is
-    not a cross-NUMA world (already folded, or no network peers) or when
-    p2p_split cannot serve it (more than 64 experts per rank)."""
+    110-SM EP8 tables, ``hybrid``), else ``rule_backend``. A ``hybrid`` anchor
+    on a driver that cannot run the hybrid yields ``p2p_split`` (its default
+    knobs). None when the shape is not a cross-NUMA world (already folded, or
+    no network peers) or when no backend can serve it."""
     if getattr(shape, "ep_numa_split", False) or shape.ep_cross_numa_peer_count <= 0:
         return None
     topology = topology_of(shape)
     if topology is not None:
         signature = (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
         entry = nearest_entry(signature, topology, shape.tokens_per_rank, device_of(shape))
-        if entry is not None and entry["knobs"].get("backend") is not None:
-            return entry["knobs"]["backend"]
-    if shape.num_total_experts // shape.expert_parallel_size > SPLIT_MAX_EXPERTS_PER_RANK:
-        return None
-    return "p2p_split"
+        backend = None if entry is None else entry["knobs"].get("backend")
+        if backend == "hybrid" and not hybrid_available(shape):
+            return "p2p_split" if (shape.num_total_experts // shape.expert_parallel_size
+                                   <= SPLIT_MAX_EXPERTS_PER_RANK) else None
+        if backend is not None:
+            return backend
+    return rule_backend(shape)
 
 
 def overrides_for(knobs: dict) -> dict:
@@ -176,5 +219,5 @@ def overrides_for(knobs: dict) -> dict:
     return out
 
 
-__all__ = ["LEGACY_DEVICE", "device_of", "lookup", "nearest_entry", "overrides_for",
-           "preferred_ep8_backend", "topology_of"]
+__all__ = ["LEGACY_DEVICE", "SPLIT_RULE_MAX_TOKENS", "device_of", "has_table", "hybrid_available", "lookup",
+           "nearest_entry", "overrides_for", "preferred_ep8_backend", "rule_backend", "topology_of"]

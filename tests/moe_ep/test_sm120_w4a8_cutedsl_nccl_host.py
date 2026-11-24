@@ -485,11 +485,43 @@ def test_host_p2p_domain_runs_p2p_direct_over_both_sockets(monkeypatch) -> None:
 
 @pytest.mark.parametrize("tokens", (16, 128, 512, 4096))
 def test_cross_numa_default_is_p2p_split_on_any_sm_count(tokens: int) -> None:
-    """No rule selects the GIN-ring hybrid: an untabulated cross-NUMA EP8 (e.g.
-    156-SM RTX 6000D) defaults to p2p_split at every token count."""
+    """Decode-to-prefill sizes of a cross-NUMA EP8 on another device (e.g.
+    156-SM RTX 6000D) stay on p2p_split (its table anchors, else the vendored
+    rule's p2p_split range up to SPLIT_RULE_MAX_TOKENS); the FlashInfer shim
+    runs p2p_split for every cross-NUMA world in any case."""
     import dataclasses
 
     real = dataclasses.replace(
         _shape(DSV41, tokens, ep=8, same=3, cross=4), num_sms=156
     )
     assert tuned_table.preferred_ep8_backend(real) == "p2p_split"
+
+
+@pytest.mark.parametrize("tokens", (16, 128))
+@pytest.mark.parametrize(
+    "ep,same,split", ((4, 3, False), (8, 7, True)), ids=("ep4", "ep8_split")
+)
+def test_untabulated_decode_uses_the_generic_preset(
+    tokens: int, ep: int, same: int, split: bool
+) -> None:
+    """A model without a tuned table gets the vendored generic decode preset
+    (k1_stages 3, K2 tail reclaim, FC1 utility, 80/30 SMs); tabulated models
+    keep their table entries."""
+    from moe_sm120_mxfp4mxfp8_split.heuristic import generic_decode_knobs
+
+    other = (7168, 3072, 8, 256)  # no table on any topology/device
+    assert generic_decode_knobs(
+        _shape(other, tokens, ep=ep, same=same, cross=0, split=split)
+    )
+    spec = _spec(other, tokens, ep=ep, same=same, cross=0, split=split)
+    assert spec.kernel.k1_stages == 3
+    assert spec.kernel.k2_tail_reclaim and spec.kernel.fc1_utility_postprocess
+    assert (spec.kernel.k1_sms, spec.kernel.k2_sms) == (80, 30)
+    assert spec.kernel.comm_backend == "p2p_direct"
+    for model in (DSV41, GLM53):
+        assert (
+            generic_decode_knobs(
+                _shape(model, tokens, ep=ep, same=same, cross=0, split=split)
+            )
+            is None
+        )

@@ -111,6 +111,18 @@ class NativeGreenContextResources:
         num_comm_streams: int = 4,
         device: Optional[int] = None,
     ) -> "NativeGreenContextResources":
+        from .driver_caps import driver_cuda_version, hybrid_sm_split_available
+
+        if not hybrid_sm_split_available():
+            version = driver_cuda_version()
+            raise RuntimeError(
+                "the GIN-ring hybrid (nvshmem_hybrid) needs four Green "
+                "Contexts from the CUDA 13.1 structured SM split "
+                "(cuDevSmResourceSplit); this driver reports CUDA "
+                f"{version // 1000}.{version % 1000 // 10}. Use p2p_split "
+                "(the cross-NUMA default without --comm_backend) or a driver "
+                ">= 13.1."
+            )
         from cuda.bindings import driver as cuda
         from cuda.core import Device, SMResourceOptions
 

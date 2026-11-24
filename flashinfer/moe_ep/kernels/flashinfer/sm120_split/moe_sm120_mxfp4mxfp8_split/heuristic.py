@@ -4,6 +4,10 @@ This module is deliberately independent of torch, CUDA, NVSHMEM, argparse,
 and process environment state.  The FlashInfer-facing call path can therefore
 select one JIT configuration with a small amount of integer arithmetic; the
 benchmark runner may apply explicit user overrides after selection.
+One exception: the default backend of an unfolded cross-NUMA EP world
+(``tuned_table.preferred_ep8_backend``) reads a cached driver capability (the
+CUDA 13.1 structured SM split the GIN-ring hybrid needs; see
+``runtime.driver_caps``).
 """
 
 from __future__ import annotations
@@ -371,6 +375,10 @@ class MegaMoEHeuristicOverrides:
     # anchors whose measured K2 N16 tile came from the automatic decode policy
     # (which uses natural registers) rather than an explicit tile override.
     k2_natural_regs: Optional[bool] = None
+    # Generic decode preset for untabulated shapes (``generic_decode_knobs``):
+    # None = on where it applies, False = off (the tuner measures table knobs
+    # relative to the selection without it). Consumed by the table layer.
+    generic_decode_preset: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -508,7 +516,8 @@ class MegaMoEKernelConfig:
         updates = {
             name: value
             for name, value in vars(overrides).items()
-            if value is not None
+            # The preset switch selects table-layer defaults, not a config field.
+            if value is not None and name != "generic_decode_preset"
         }
         if not updates:
             return self
@@ -656,16 +665,24 @@ def select_legacy_config(
     cross_numa = shape.ep_cross_numa_peer_count > 0
 
     if cross_numa:
-        # Unfolded cross-NUMA peers mean the GIN-ring transport, which is an
-        # explicit opt-in only: the default for a cross-NUMA EP world is
-        # p2p_split, which callers express by folding the cross peers into
-        # the same-domain count with ``ep_numa_split=True``.
+        # Unfolded cross-NUMA peers mean the GIN-ring transport. Without an
+        # explicit backend it is the default only where the backend rule
+        # (``tuned_table.preferred_ep8_backend``: table anchor, else
+        # p2p_split up to SPLIT_RULE_MAX_TOKENS and hybrid above when the
+        # driver can split the SMs for it) picks it. Where the rule picks
+        # p2p_split, callers express it by folding the cross peers into the
+        # same-domain count with ``ep_numa_split=True``.
         if overrides is None or overrides.comm_backend is None:
-            raise ValueError(
-                "cross-NUMA EP peers without an explicit comm_backend: use "
-                "p2p_split (fold the cross peers into ep_same_numa_peer_count "
-                "and set ep_numa_split=True) or pass comm_backend explicitly"
-            )
+            from .tuned_table import preferred_ep8_backend
+
+            if preferred_ep8_backend(shape) != "hybrid":
+                raise ValueError(
+                    "cross-NUMA EP peers without an explicit comm_backend: "
+                    "this size uses p2p_split (fold the cross peers into "
+                    "ep_same_numa_peer_count and set ep_numa_split=True; see "
+                    "tuned_table.preferred_ep8_backend) or pass comm_backend "
+                    "explicitly"
+                )
         # The RTX Pro 5000 cross-NUMA scan selected 48/16/16/30. Preserve
         # those proportions on other SM120 devices and align explicit groups
         # to the device's Green Context co-schedule granularity.
@@ -1012,6 +1029,71 @@ def _builtin_policy():
     return json.loads(Path(__file__).with_name("model_policy.json").read_text())
 
 
+def _in_calibrated_policy_scope(shape) -> bool:
+    """Shapes the calibrated EP4 model policy (``model_policy.json``) covers."""
+    return (
+        (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
+        in ((4096, 4096, 6, 256), (4096, 4096, 8, 288))
+        and (shape.expert_parallel_size, shape.tensor_parallel_size,
+             shape.data_parallel_size, shape.ep_same_numa_peer_count,
+             shape.ep_cross_numa_peer_count, shape.num_sms,
+             shape.sm_min_partition, shape.sm_partition_alignment)
+        == (4, 1, 1, 3, 0, 110, 8, 8)
+    )
+
+
+# Generic decode preset for shapes without a table (another model, SM count
+# or device), applied like a table entry: knobs relative to the rule-based
+# selection, explicit overrides win. It is the pattern the tuned decode
+# anchors share (156-SM dsv41 EP8 T16-64, 110-SM dsv41 EP16 T128, glm53 EP16
+# T64-128): three K1 pipeline stages, K2 tail reclaim, the FC1 utility
+# postprocess, evict-first weight loads and a 80/30 K1/K2 split (scaled to the
+# device). Dual K1 residency / K2 launch factor 2 / K1 N16, which several
+# dsv41 anchors add, were slower on held-out GLM-5.3 (110 SMs, cold L2, p50):
+# EP4 T16/32/64/128 legacy 836.6/932.9/958.5/1132.8 us, dual+N16 preset
+# 815.1/908.3/930.1/1057.9, this preset 801.8/900.1/921.6/984.1; EP8
+# p2p_split 659.5/688.1/755.7/935.9, 557.1/576.5/645.1/923.6,
+# 532.5/543.7/624.6/747.5. Scope: the validated P2P topologies (EP4 in one
+# NUMA node, EP8 p2p_split over two), up to GENERIC_DECODE_MAX_TOKENS tokens
+# per rank and RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT expected rows per
+# expert; never where a table exists for the (signature, topology, device),
+# nor in the calibrated EP4 policy's scope.
+GENERIC_DECODE_MAX_TOKENS = 128
+GENERIC_DECODE_TOPOLOGIES = ("ep4_1numa", "ep8_2numa")
+GENERIC_DECODE_KNOBS = dict(
+    k1_stages=3, k2_tail_reclaim="on", fc1_utility_postprocess="on",
+    weight_eviction_policy="evict_first",
+)
+GENERIC_DECODE_SM_PARTITION = (80, 30)  # K1 | K2 on 110 SMs; scaled to the device
+
+
+def generic_decode_knobs(shape) -> Optional[dict]:
+    """Table-format knobs of the generic decode preset for ``shape``, or None."""
+    from . import tuned_table
+
+    if not (1 <= shape.tokens_per_rank <= GENERIC_DECODE_MAX_TOKENS
+            and shape.expected_rows_per_expert <= RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT
+            and shape.ep_cross_numa_peer_count == 0
+            and not _in_calibrated_policy_scope(shape)):
+        return None
+    topology = tuned_table.topology_of(shape)
+    if topology not in GENERIC_DECODE_TOPOLOGIES:
+        return None
+    signature = (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
+    if tuned_table.has_table(signature, topology, tuned_table.device_of(shape)):
+        return None
+    try:
+        k1_sms, k2_sms = _scale_sm_partition(
+            num_sms=shape.num_sms, reference_counts=GENERIC_DECODE_SM_PARTITION,
+            min_partition=shape.sm_min_partition, alignment=shape.sm_partition_alignment)
+    except ValueError:
+        return None
+    knobs = dict(GENERIC_DECODE_KNOBS, sms=[k1_sms, 0, 0, k2_sms])
+    if topology == "ep8_2numa":
+        knobs["backend"] = "p2p_split"
+    return knobs
+
+
 def _with_tuned_table(shape, overrides):
     """Fill unset overrides from the ``tuned_table.json`` anchor entry.
 
@@ -1022,7 +1104,15 @@ def _with_tuned_table(shape, overrides):
     """
     from . import tuned_table
 
+    preset_switch = overrides.generic_decode_preset if overrides is not None else None
+    if overrides is not None and preset_switch is not None:
+        overrides = replace(overrides, generic_decode_preset=None)
     entry = tuned_table.lookup(shape)
+    if entry is None and preset_switch is not False:
+        knobs = generic_decode_knobs(shape)
+        if knobs is not None:
+            # Applied exactly like a table anchor at this token count.
+            entry = dict(tokens=shape.tokens_per_rank, knobs=knobs)
     if entry is None:
         return overrides
     table = tuned_table.overrides_for(entry["knobs"])
@@ -1082,13 +1172,7 @@ def _select_config_and_dispatch_base(shape, overrides=None, *, use_tuned_default
     # accidentally accepted by filling their missing fields from the profile.
     incumbent = select_legacy_config(shape, overrides)
     if not use_tuned_defaults or not (
-        (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
-        in ((4096, 4096, 6, 256), (4096, 4096, 8, 288))
-        and (shape.expert_parallel_size, shape.tensor_parallel_size,
-             shape.data_parallel_size, shape.ep_same_numa_peer_count,
-             shape.ep_cross_numa_peer_count, shape.num_sms,
-             shape.sm_min_partition, shape.sm_partition_alignment)
-        == (4, 1, 1, 3, 0, 110, 8, 8)
+        _in_calibrated_policy_scope(shape)
         and incumbent.comm_backend == "p2p_direct"
         and incumbent.token_back_mode == "epi_warps"
     ):
@@ -1226,6 +1310,8 @@ def select_config_and_dispatch(shape, overrides=None, *, use_tuned_defaults=True
     """
     if use_tuned_defaults:
         overrides = _with_tuned_table(shape, overrides)
+    elif overrides is not None and overrides.generic_decode_preset is not None:
+        overrides = replace(overrides, generic_decode_preset=None)
     explicit = overrides.weight_eviction_policy if overrides is not None else None
     if explicit not in (None, "default", "evict_first"):
         raise ValueError("weight_eviction_policy must be default or evict_first")

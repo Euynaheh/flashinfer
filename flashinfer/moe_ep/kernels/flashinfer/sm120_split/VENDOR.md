@@ -1,8 +1,7 @@
 # SM120 W4A8 Split Kernel Drop
 
 This directory contains the SM120 MXFP4/MXFP8 split implementation at commit
-`5f76519` (`ea97ff7` + `5f76519` on top of the previous drop
-`500b2496c364a6029430806678ebc7c04c218ad3`).
+`3b377cd` (on top of the previous drop `5f76519`).
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
 contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
@@ -10,6 +9,31 @@ The FI adapter is `flashinfer/moe_ep/shims/sm120/split_cutedsl/`.
 Backends use its package exports rather than raw modules.
 
 ## Changes since the previous drop
+
+- Generic decode preset (`heuristic.generic_decode_knobs`): a shape without
+  a tuned table for its (signature, topology, device) and outside the
+  calibrated EP4 policy gets, on EP4 in one NUMA node and on EP8
+  `p2p_split`, up to 128 tokens per rank and 32 expected rows per expert,
+  `k1_stages=3`, K2 tail reclaim, the FC1 utility postprocess, evict-first
+  weights and a 80/30 K1/K2 split scaled to the device. It is applied like a
+  table entry, so the shim's knobs (and its `p2p_split` K2/`rank_local_combine`
+  constraints) still win; the override field `generic_decode_preset=False`
+  turns it off. Standalone GLM-5.3 treated as untabulated (110 SMs, ABBA p50
+  us): EP4 T16/32/64/128 836.6/932.9/957.4/1131.6 -> 801.8/899.7/920.6/984.9,
+  EP8 p2p_split 658.4/688.1/754.7/934.7 -> 534.5/544.3/626.7/745.2 (within
+  +-1 % of the tuned tables at 6 of 8 points). Tabulated shapes resolve
+  exactly as before.
+- Standalone cross-NUMA backend rule (`tuned_table.rule_backend`): untabulated
+  unfolded cross-NUMA worlds use `p2p_split` up to 16384 tokens per rank and
+  the GIN-ring hybrid above when the driver offers the CUDA 13.1 structured
+  SM split (`runtime/driver_caps.py`, new; `MEGAMOE_HYBRID_SM_SPLIT=0|1`
+  forces it). FlashInfer has no hybrid transport: the shim keeps selecting
+  `p2p_split` for every cross-NUMA world (`select_comm_backend`), so only
+  the vendored helpers change. `runtime/green_context.py`
+  (`NativeGreenContextResources.create`, hybrid only) now fails with a clear
+  message on drivers without the split.
+
+## Changes in the `5f76519` drop
 
 - RTX 6000D (156 SMs, Green Context 8/8): the K1/K2 ready-queue DONE
   sentinel count is `megamoe_kernel.ready_queue_done_sentinels(total_sms)`
