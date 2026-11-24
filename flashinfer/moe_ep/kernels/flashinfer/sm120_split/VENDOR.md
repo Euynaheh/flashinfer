@@ -1,7 +1,7 @@
 # SM120 W4A8 Split Kernel Drop
 
 This directory contains the SM120 MXFP4/MXFP8 split implementation at commit
-`7211ca9cd83355d404e9d4fa5b74bba5bf659369` (previous drop:
+`1864b29da454c9129737920814a2d9cd70b18d36` (previous drop:
 `29e39e98324dde862e11a40012a789a52f0c5f4f`).
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
@@ -25,6 +25,10 @@ Backends use its package exports rather than raw modules.
   DSv4.1-Flash T32/64/128/256 640.0/744.4/959.7/1475.6 ->
   621.6/684.0/850.4/1253.4; GLM5.3-Flash 441.3/544.8/696.3/1151.5 ->
   427.0/501.2/624.6/1004.5; T16 unchanged.
+- `tuned_table.json` (1864b29): EP16 anchors retuned on the packed dispatch
+  (DSv4.1-Flash T128/T256, GLM5.3-Flash T64/T128). FlashInfer does not run
+  EP16, so the `ep16_2x2numa` entries are inert here; EP4/EP8 entries are
+  unchanged.
 
 ## Changes in the previous drop (29e39e9)
 

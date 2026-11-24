@@ -103,16 +103,22 @@
      "tokens": 128,
      "knobs": {
       "backend": "p2p_split",
-      "k2_n": 32,
-      "k1_ctas_per_sm": 2,
-      "k2_launch_factor": 2,
-      "weight_eviction_policy": "evict_first"
+      "k1_stages": 3,
+      "k2_tail_reclaim": "on",
+      "sms": [
+       80,
+       0,
+       0,
+       30
+      ],
+      "weight_eviction_policy": "evict_first",
+      "fc1_utility_postprocess": "on"
      },
-     "p50_us": 957.4,
-     "default_us": 1200.1,
+     "p50_us": 780.3,
+     "default_us": 1044.0,
      "confirm": {
-      "best_us": 962.5,
-      "default_us": 1190.9,
+      "best_us": 782.3,
+      "default_us": 1030.1,
       "seed": 6197
      }
     },
@@ -121,20 +127,21 @@
      "knobs": {
       "backend": "p2p_split",
       "k1_stages": 3,
+      "k2_tail_reclaim": "on",
       "sms": [
        80,
        0,
        0,
        30
       ],
-      "k2_tail_reclaim": "on",
-      "weight_eviction_policy": "evict_first"
+      "weight_eviction_policy": "evict_first",
+      "k2_n": 32
      },
-     "p50_us": 1474.6,
-     "default_us": 1646.6,
+     "p50_us": 1232.9,
+     "default_us": 1430.5,
      "confirm": {
-      "best_us": 1489.4,
-      "default_us": 1654.8,
+      "best_us": 1236.0,
+      "default_us": 1437.7,
       "seed": 6197
      }
     }
@@ -547,24 +554,25 @@
      "tokens": 64,
      "knobs": {
       "backend": "p2p_split",
-      "k1_n": 32,
-      "k2_n": 16,
-      "k2_warps": 8,
-      "k1_ctas_per_sm": 1,
-      "k2_launch_factor": 2,
-      "k1_stages": 3,
-      "weight_prefetch_ahead": 4,
       "fc1_utility_postprocess": "on",
-      "weight_eviction_policy": "evict_first",
+      "k1_stages": 3,
+      "k2_n": 32,
       "k2_tail_reclaim": "on",
-      "dispatch_chunk_tokens": 32,
-      "k2_ready_queue_bundle": 2
+      "weight_eviction_policy": "evict_first",
+      "weight_prefetch_ahead": 0,
+      "k2_warps": 8,
+      "sms": [
+       80,
+       0,
+       0,
+       30
+      ]
      },
-     "p50_us": 538.6,
-     "default_us": 750.6,
+     "p50_us": 483.3,
+     "default_us": 667.6,
      "confirm": {
-      "best_us": 548.9,
-      "default_us": 735.2,
+      "best_us": 488.4,
+      "default_us": 684.0,
       "seed": 6197
      }
     },
@@ -572,18 +580,24 @@
      "tokens": 128,
      "knobs": {
       "backend": "p2p_split",
-      "k2_n": 32,
-      "weight_prefetch_ahead": 4,
-      "k1_stages": 3,
-      "k2_tail_reclaim": "on",
       "fc1_utility_postprocess": "on",
-      "weight_eviction_policy": "evict_first"
+      "k1_stages": 3,
+      "k2_n": 32,
+      "k2_tail_reclaim": "on",
+      "weight_eviction_policy": "evict_first",
+      "weight_prefetch_ahead": 4,
+      "sms": [
+       80,
+       0,
+       0,
+       30
+      ]
      },
-     "p50_us": 696.3,
-     "default_us": 842.7,
+     "p50_us": 608.3,
+     "default_us": 768.0,
      "confirm": {
-      "best_us": 702.5,
-      "default_us": 829.4,
+      "best_us": 626.7,
+      "default_us": 754.7,
       "seed": 6197
      }
     },
