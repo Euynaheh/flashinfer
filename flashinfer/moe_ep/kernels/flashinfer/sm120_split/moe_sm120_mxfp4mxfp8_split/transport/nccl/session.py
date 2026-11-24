@@ -129,6 +129,15 @@ class NcclSession:
         self._group = group
 
         env = dict(_GIN_ENV_DEFAULTS if self.network else _LSA_ENV_DEFAULTS)
+        topology = getattr(context, "ep_transport_topology", None)
+        if getattr(topology, "p2p_scope", "numa") == "host":
+            # One P2P domain per host: NCCL must map cross-socket pairs for LSA
+            # (P2P_LEVEL=SYS) and must not split the host into one NCCL node
+            # per socket joined through the NIC (NET_DISABLE_INTRA; on RTX
+            # 6000D its ring search otherwise prefers NIC 48 GB/s over SYS
+            # 16 GB/s, giving nNodes=2 and an LSA team of 4).
+            env["NCCL_P2P_LEVEL"] = "SYS"
+            env["NCCL_NET_DISABLE_INTRA"] = "1"
         env = {k: (v if k in _FORCED else os.environ.get(k, v)) for k, v in env.items()}
         hca_map = os.environ.get("MEGAMOE_GIN_HCA_MAP")
         if self.network and hca_map and "NCCL_IB_HCA" not in os.environ:

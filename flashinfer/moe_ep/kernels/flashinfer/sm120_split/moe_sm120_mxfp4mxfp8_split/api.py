@@ -277,11 +277,15 @@ def select_compile_spec(
     build: Optional[SplitKernelBuildOptions] = None,
     use_tuned_defaults: bool = True,
     ep_numa_split: bool = False,
+    ep_split_domain_size: int = 4,
 ) -> MegaMoECompileSpec:
     """Resolve the production heuristic into a cacheable compile spec.
 
     ``ep_numa_split`` selects the p2p_split view of a NUMA-split EP world:
-    callers fold the cross-NUMA peers into ``ep_same_numa_peer_count``.
+    callers fold the cross-NUMA peers into ``ep_same_numa_peer_count`` and
+    pass the real P2P-domain size (4: a NUMA node of a 2 x 4 host) in
+    ``ep_split_domain_size``. Unfolded cross-NUMA peers require an explicit
+    ``overrides.comm_backend`` (the GIN-ring transport is opt-in only).
     """
 
     problem.validate()
@@ -300,6 +304,7 @@ def select_compile_spec(
         sm_min_partition=sm_min_partition,
         sm_partition_alignment=sm_partition_alignment,
         ep_numa_split=ep_numa_split,
+        ep_split_domain_size=ep_split_domain_size,
     )
     kernel, dispatch = select_config_and_dispatch(heuristic_input, overrides,
         use_tuned_defaults=use_tuned_defaults)
@@ -344,6 +349,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         Sm120Fc2CombineN16DualGroupKernel,
     )
     from .kernel_k2_finalizer import Sm120K2TailFinalizerKernel
+    from .megamoe_kernel import ready_queue_done_sentinels
     from .sm120_mma import CTA_TOKEN_TILE
 
     problem = spec.problem
@@ -413,6 +419,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         k1_ready_queue_m_rotation=config.k1_ready_queue_m_rotation,
         dispatch_warp_count=spec.jit.dispatch_warp_count,
         jit_config=spec.jit,
+        ready_queue_done_sentinels=ready_queue_done_sentinels(config.total_sms),
     )
 
     k1 = build_sm120_dispatch_fc1_kernel(

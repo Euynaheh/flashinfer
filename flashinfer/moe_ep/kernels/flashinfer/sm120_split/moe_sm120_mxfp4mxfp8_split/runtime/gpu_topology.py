@@ -2,9 +2,28 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence, Tuple
+
+# P2P domain scope (``MEGAMOE_P2P_DOMAIN``):
+# * ``numa`` (default): a P2P (LSA) domain is one NUMA node of one host; every
+#   other peer, cross-NUMA or on another host, is a network/shadow peer.
+# * ``host``: every GPU of a host is in one P2P domain. Only for hosts whose
+#   cross-socket P2P stays fast when all GPUs store to each other at once;
+#   NCCL must map every local pair (the session sets NCCL_P2P_LEVEL=SYS).
+#   Not auto-detected: NCCL maps cross-socket pairs on hosts where concurrent
+#   cross-switch stores collapse to ~1 GB/s, so mapping alone proves nothing.
+P2P_DOMAIN_ENV = "MEGAMOE_P2P_DOMAIN"
+P2P_SCOPES = ("numa", "host")
+
+
+def p2p_scope_from_env() -> str:
+    scope = os.environ.get(P2P_DOMAIN_ENV, "numa").strip().lower() or "numa"
+    if scope not in P2P_SCOPES:
+        raise ValueError(f"{P2P_DOMAIN_ENV}={scope!r}: expected one of {P2P_SCOPES}")
+    return scope
 
 
 @dataclass(frozen=True)
@@ -14,11 +33,15 @@ class GpuTopologyEntry:
     pci_bus_id: str
     numa_node: int
     # Host identity: PCI bus IDs and NUMA node numbers repeat across hosts, so
-    # a GPU is (host, pci_bus_id) and a P2P domain is (host, numa_node).
+    # a GPU is (host, pci_bus_id) and a P2P domain is (host, numa_node), or
+    # (host,) with the ``host`` P2P scope.
     host: str = ""
+    p2p_scope: str = "numa"
 
     @property
-    def p2p_domain(self) -> Tuple[str, int]:
+    def p2p_domain(self) -> Tuple:
+        if self.p2p_scope == "host":
+            return (self.host,)
         return (self.host, self.numa_node)
 
 
@@ -28,6 +51,12 @@ class EpTransportTopology:
     same_numa_peer_count: int
     cross_numa_peer_count: int
     force_ibgda_peer_mask: int
+    p2p_scope: str = "numa"
+
+    @property
+    def p2p_domain_size(self) -> int:
+        """GPUs in this rank's P2P domain (itself included)."""
+        return self.same_numa_peer_count + 1
 
 
 def _check_cuda(result, operation: str, cuda_driver):
@@ -73,6 +102,7 @@ def discover_gpu_topology(local_rank: int, global_rank: int) -> GpuTopologyEntry
         pci_bus_id=pci_bus_id,
         numa_node=numa_node,
         host=socket.gethostname(),
+        p2p_scope=p2p_scope_from_env(),
     )
 
 
@@ -105,9 +135,13 @@ def derive_ep_transport_topology(
         raise RuntimeError(f"EP ranks do not map to unique GPUs: {peers!r}")
     if not 0 <= ep_rank < ep_size:
         raise RuntimeError(f"EP rank {ep_rank} is outside [0, {ep_size})")
+    scopes = {peer.p2p_scope for peer in peers}
+    if len(scopes) != 1:
+        raise RuntimeError(f"EP ranks disagree on {P2P_DOMAIN_ENV}: {sorted(scopes)}")
 
-    # Only GPUs on the same host and NUMA node are P2P (LSA) peers; every
-    # other peer, cross-NUMA or on another host, goes through the GIN network.
+    # Only GPUs in the same P2P domain (same host and NUMA node, or same host
+    # with the ``host`` scope) are P2P (LSA) peers; every other peer goes
+    # through the GIN network.
     own_domain = peers[ep_rank].p2p_domain
     force_mask = 0
     same_numa = 0
@@ -125,6 +159,7 @@ def derive_ep_transport_topology(
         same_numa_peer_count=same_numa,
         cross_numa_peer_count=cross_numa,
         force_ibgda_peer_mask=force_mask,
+        p2p_scope=scopes.pop(),
     )
 
 
@@ -137,6 +172,7 @@ def format_ep_topology(topology: EpTransportTopology) -> str:
         f"{devices}; same={topology.same_numa_peer_count}, "
         f"cross={topology.cross_numa_peer_count}, "
         f"force_ibgda_mask=0x{topology.force_ibgda_peer_mask:x}"
+        + ("" if topology.p2p_scope == "numa" else f", p2p_domain={topology.p2p_scope}")
     )
 
 
@@ -147,4 +183,6 @@ __all__ = [
     "derive_ep_transport_topology",
     "format_ep_topology",
     "gather_ep_transport_topology",
+    "P2P_DOMAIN_ENV",
+    "p2p_scope_from_env",
 ]

@@ -251,6 +251,9 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
         self.activation_eviction_policy = "default"
         self.k1_ready_queue: bool = False
         self.k1_ready_queue_base: int = 0
+        # DONE sentinels appended to the K1/K2 ready queues (one per consumer
+        # CTA); see megamoe_kernel.ready_queue_done_sentinels.
+        self.ready_queue_done_sentinels: int = 256
         self.scheduler_generation_mode: Literal["fused", "fc1", "fc2"] = "fused"
         self.scheduler_needs_token_layout: bool = False
         self.fc2_ready_wait_enabled: bool = True
@@ -6472,7 +6475,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                     if lane_idx == cutlass.Int32(0):
                         sentinel_base = cute.arch.atomic_add(
                             k2_ready_queue_state.iterator + cutlass.Int32(1),
-                            cutlass.Int32(256),
+                            cutlass.Int32(self.ready_queue_done_sentinels),
                             scope="gpu",
                         )
                     sentinel_base = cute.arch.shuffle_sync(
@@ -6481,7 +6484,9 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         mask=0xFFFFFFFF,
                         mask_and_clamp=31,
                     )
-                    for sentinel_iter in cutlass.range_constexpr(0, 8):
+                    for sentinel_iter in cutlass.range_constexpr(
+                        0, self.ready_queue_done_sentinels // 32
+                    ):
                         sentinel_pos = (
                             sentinel_base
                             + lane_idx
@@ -6492,7 +6497,9 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         ] = cutlass.Int32(WorkTileState.DONE)
                     cute.arch.sync_warp()
                     cute.arch.fence_acq_rel_gpu()
-                    for sentinel_iter in cutlass.range_constexpr(0, 8):
+                    for sentinel_iter in cutlass.range_constexpr(
+                        0, self.ready_queue_done_sentinels // 32
+                    ):
                         sentinel_pos = (
                             sentinel_base
                             + lane_idx

@@ -1,24 +1,35 @@
-"""Measured anchor table: complete launch configurations per (model, topology).
+"""Measured anchor table: complete launch configurations per (model, topology, device).
 
 ``tuned_table.json`` holds, for each tuned signature (hidden, intermediate,
-top-k, experts) and EP topology, the configuration that
+top-k, experts), EP topology and device, the configuration that
 ``tools/sm120_w4a8_tuning/tune_table.py`` selected at a set of token anchors.
 A token count between anchors uses the anchor nearest in log space (the
 boundary is the geometric midpoint), so every token count is covered; counts
 outside the anchor range use the closest end anchor.
 
-Topologies (110-SM SM120, DP1/TP1, 8-SM partition granularity):
+Device: a table's optional ``device`` field is ``[num_sms, sm_min_partition,
+sm_partition_alignment]`` of the Green Context SM resource it was tuned on;
+tables without it are the original 110-SM RTX PRO 5000 tables ``[110, 8, 8]``.
+A table applies only to its own device (SM partitions are absolute counts).
+
+Topologies (DP1/TP1):
 
 * ``ep4_1numa``: EP4 inside one NUMA node (p2p_direct).
 * ``ep8_2numa``: EP8 as 2 x 4 GPUs on two NUMA nodes. An entry's ``backend``
   is ``p2p_split`` (LSA + cross-NUMA shadow transport) or ``hybrid``
-  (LSA + GIN rings); its knobs are valid only for that backend.
+  (LSA + GIN rings, only in the original 110-SM tables); its knobs are valid
+  only for that backend.
+* ``ep8_1domain``: EP8 as one P2P domain (``MEGAMOE_P2P_DOMAIN=host``: every
+  pair of the host LSA-mapped, p2p_direct over all eight GPUs).
 * ``ep16_2x2numa``: EP16 over two hosts of 2 x 4 GPUs (P2P only inside a
   NUMA node, every other peer through GIN); ``p2p_split`` only.
+* ``ep16_2x1domain``: EP16 over two hosts that are one P2P domain each
+  (``MEGAMOE_P2P_DOMAIN=host``; the other host's 8 peers through GIN);
+  ``p2p_split`` only.
 
 The table is a performance hint. Explicit overrides always win, and shapes,
-topologies or backends it does not cover fall back to the rule-based
-selector.
+topologies, devices or backends it does not cover fall back to the
+rule-based selector.
 """
 
 from __future__ import annotations
@@ -42,32 +53,50 @@ def _load() -> dict:
     return data
 
 
-# (topology, same-domain peers, network peers) of the real NUMA-split layouts.
-_SPLIT_LAYOUTS = {8: ("ep8_2numa", 3, 4), 16: ("ep16_2x2numa", 3, 12)}
+LEGACY_DEVICE = (110, 8, 8)  # tables without a ``device`` field
+
+# (EP size, same-domain peers, network peers) of the real (unfolded) layouts.
+_REAL_LAYOUTS = {
+    (4, 3, 0): "ep4_1numa",
+    (8, 3, 4): "ep8_2numa",
+    (8, 7, 0): "ep8_1domain",
+    (16, 3, 12): "ep16_2x2numa",
+    (16, 7, 8): "ep16_2x1domain",
+}
+# p2p_split folds the network peers into one P2P group (the runner passes
+# ep-1 same-domain / 0 network peers with ep_numa_split and the real domain
+# size in ep_split_domain_size): (EP size, domain size) -> topology.
+_SPLIT_LAYOUTS = {
+    (8, 4): "ep8_2numa",
+    (16, 4): "ep16_2x2numa",
+    (16, 8): "ep16_2x1domain",
+}
+# Topologies whose table entries carry a backend (p2p_split / hybrid).
+_SPLIT_TOPOLOGIES = frozenset(_SPLIT_LAYOUTS.values())
+
+
+def device_of(shape) -> Tuple[int, int, int]:
+    return (int(shape.num_sms), int(shape.sm_min_partition), int(shape.sm_partition_alignment))
 
 
 def topology_of(shape) -> Optional[str]:
     """Topology key of a heuristic input, or None if no table can apply."""
-    if (shape.data_parallel_size, shape.tensor_parallel_size, shape.num_sms,
-            shape.sm_min_partition, shape.sm_partition_alignment) != (1, 1, 110, 8, 8):
+    if (shape.data_parallel_size, shape.tensor_parallel_size) != (1, 1):
         return None
     ep, same, cross = (shape.expert_parallel_size, shape.ep_same_numa_peer_count,
                        shape.ep_cross_numa_peer_count)
-    split = getattr(shape, "ep_numa_split", False)
-    if ep == 4 and (same, cross) == (3, 0) and not split:
-        return "ep4_1numa"
-    if ep in _SPLIT_LAYOUTS:
-        name, real_same, real_cross = _SPLIT_LAYOUTS[ep]
-        # p2p_split folds the network peers into one P2P group (the runner
-        # passes ep-1 same-domain / 0 network peers with ep_numa_split).
-        if (same, cross) == ((ep - 1, 0) if split else (real_same, real_cross)):
-            return name
-    return None
+    if getattr(shape, "ep_numa_split", False):
+        if (same, cross) != (ep - 1, 0):
+            return None
+        return _SPLIT_LAYOUTS.get((ep, getattr(shape, "ep_split_domain_size", 4)))
+    return _REAL_LAYOUTS.get((ep, same, cross))
 
 
-def nearest_entry(signature: Tuple[int, int, int, int], topology: str, tokens: int) -> Optional[dict]:
+def nearest_entry(signature: Tuple[int, int, int, int], topology: str, tokens: int,
+                  device: Tuple[int, int, int] = LEGACY_DEVICE) -> Optional[dict]:
     for table in _load().get("tables", []):
-        if tuple(table["signature"]) == tuple(signature) and table["topology"] == topology:
+        if (tuple(table["signature"]) == tuple(signature) and table["topology"] == topology
+                and tuple(table.get("device", LEGACY_DEVICE)) == tuple(device)):
             entries = table["entries"]
             if not entries:
                 return None
@@ -81,43 +110,40 @@ def lookup(shape) -> Optional[dict]:
     if topology is None or shape.tokens_per_rank <= 0:
         return None
     signature = (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
-    entry = nearest_entry(signature, topology, shape.tokens_per_rank)
+    entry = nearest_entry(signature, topology, shape.tokens_per_rank, device_of(shape))
     if entry is None:
         return None
     backend = entry["knobs"].get("backend")
-    if topology != "ep4_1numa":
+    if topology in _SPLIT_TOPOLOGIES:
         want = "p2p_split" if getattr(shape, "ep_numa_split", False) else "hybrid"
         if backend != want:
             return None  # knobs were tuned for the other backend
     return entry
 
 
-# Rule for untabulated signatures, from the dsv41/glm53 measurements: the
-# cross-NUMA shadow transport wins at decode sizes (-8..-19% at T16/T128) but
-# its forwarder does not scale (2-8x slower than hybrid from T4096 on).
-SPLIT_RULE_MAX_TOKENS = 128
+# Default for a cross-NUMA EP world without a table anchor: p2p_split at every
+# token count. The GIN-ring hybrid transport is never chosen by a rule; only an
+# explicit ``comm_backend`` or a measured (110-SM) table anchor selects it.
 SPLIT_MAX_EXPERTS_PER_RANK = 64  # forwarder completion mask is 64-bit
 
 
 def preferred_ep8_backend(shape) -> Optional[str]:
-    """``p2p_split`` / ``hybrid`` for a real NUMA-split EP shape (EP8 on 2 x 4
-    GPUs or EP16 on two such hosts, network peers not yet folded): the nearest
-    table anchor's backend, else the rule above; None otherwise. EP16 uses
-    ``p2p_split`` only (the hybrid rings are not validated across hosts)."""
-    topology = topology_of(shape)
-    if topology is None or topology == "ep4_1numa" or getattr(shape, "ep_numa_split", False):
+    """Backend for a real cross-NUMA EP shape (network peers not yet folded):
+    the nearest table anchor's backend (``p2p_split`` or, in the original
+    110-SM EP8 tables, ``hybrid``), else ``p2p_split``. None when the shape is
+    not a cross-NUMA world (already folded, or no network peers) or when
+    p2p_split cannot serve it (more than 64 experts per rank)."""
+    if getattr(shape, "ep_numa_split", False) or shape.ep_cross_numa_peer_count <= 0:
         return None
-    signature = (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
-    entry = nearest_entry(signature, topology, shape.tokens_per_rank)
-    if entry is not None:
-        return entry["knobs"].get("backend")
-    experts_per_rank = shape.num_total_experts // shape.expert_parallel_size
-    if topology == "ep16_2x2numa":
-        return "p2p_split" if experts_per_rank <= SPLIT_MAX_EXPERTS_PER_RANK else None
-    if (shape.tokens_per_rank <= SPLIT_RULE_MAX_TOKENS
-            and experts_per_rank <= SPLIT_MAX_EXPERTS_PER_RANK):
-        return "p2p_split"
-    return "hybrid"
+    topology = topology_of(shape)
+    if topology is not None:
+        signature = (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
+        entry = nearest_entry(signature, topology, shape.tokens_per_rank, device_of(shape))
+        if entry is not None and entry["knobs"].get("backend") is not None:
+            return entry["knobs"]["backend"]
+    if shape.num_total_experts // shape.expert_parallel_size > SPLIT_MAX_EXPERTS_PER_RANK:
+        return None
+    return "p2p_split"
 
 
 def overrides_for(knobs: dict) -> dict:
@@ -150,4 +176,5 @@ def overrides_for(knobs: dict) -> dict:
     return out
 
 
-__all__ = ["lookup", "nearest_entry", "overrides_for", "preferred_ep8_backend", "topology_of"]
+__all__ = ["LEGACY_DEVICE", "device_of", "lookup", "nearest_entry", "overrides_for",
+           "preferred_ep8_backend", "topology_of"]

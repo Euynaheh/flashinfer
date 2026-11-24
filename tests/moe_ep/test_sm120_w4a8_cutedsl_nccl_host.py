@@ -155,7 +155,7 @@ def test_comm_backend_rejects_unsupported_requests() -> None:
             _config(DSV41, rank=0, world_size=4, knobs={"comm_backend": "p2p_split"}),
             ep4,
         )
-    with pytest.raises(ValueError, match="p2p_split"):
+    with pytest.raises(ValueError, match="MEGAMOE_P2P_DOMAIN=host"):
         select_comm_backend(
             _config(DSV41, rank=0, world_size=8, knobs={"comm_backend": "p2p_direct"}),
             ep8,
@@ -440,3 +440,56 @@ def test_push_shadow_stride_covers_the_staged_inputs() -> None:
     assert shim_runtime._push_stride(config) == span
     # The output buffer stays outside the pushed span.
     assert len(shapes) == 5
+
+
+def test_host_p2p_domain_runs_p2p_direct_over_both_sockets(monkeypatch) -> None:
+    """MEGAMOE_P2P_DOMAIN=host: one P2P domain per host, so an EP8 over both
+    sockets has no cross-NUMA peers and selects p2p_direct (no GIN)."""
+    from moe_sm120_mxfp4mxfp8_split.runtime.gpu_topology import (
+        GpuTopologyEntry,
+        derive_ep_transport_topology,
+    )
+
+    peers = [
+        GpuTopologyEntry(
+            r,
+            r,
+            f"0000:{r + 1:02x}:00.0",
+            0 if r < 4 else 1,
+            host="h",
+            p2p_scope="host",
+        )
+        for r in range(8)
+    ]
+    topology = derive_ep_transport_topology(peers, ep_rank=5)
+    assert (topology.same_numa_peer_count, topology.cross_numa_peer_count) == (7, 0)
+    assert (
+        select_comm_backend(_config(DSV41, rank=5, world_size=8), topology)
+        == "p2p_direct"
+    )
+    assert (
+        select_comm_backend(
+            _config(DSV41, rank=5, world_size=8, knobs={"comm_backend": "p2p_direct"}),
+            topology,
+        )
+        == "p2p_direct"
+    )
+    with pytest.raises(ValueError, match="cross-NUMA"):
+        select_comm_backend(
+            _config(DSV41, rank=5, world_size=8, knobs={"comm_backend": "p2p_split"}),
+            topology,
+        )
+    one_domain = _shape(DSV41, 16, ep=8, same=7, cross=0)
+    assert tuned_table.topology_of(one_domain) == "ep8_1domain"
+
+
+@pytest.mark.parametrize("tokens", (16, 128, 512, 4096))
+def test_cross_numa_default_is_p2p_split_on_any_sm_count(tokens: int) -> None:
+    """No rule selects the GIN-ring hybrid: an untabulated cross-NUMA EP8 (e.g.
+    156-SM RTX 6000D) defaults to p2p_split at every token count."""
+    import dataclasses
+
+    real = dataclasses.replace(
+        _shape(DSV41, tokens, ep=8, same=3, cross=4), num_sms=156
+    )
+    assert tuned_table.preferred_ep8_backend(real) == "p2p_split"

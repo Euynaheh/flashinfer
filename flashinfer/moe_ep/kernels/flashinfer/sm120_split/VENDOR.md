@@ -1,8 +1,8 @@
 # SM120 W4A8 Split Kernel Drop
 
 This directory contains the SM120 MXFP4/MXFP8 split implementation at commit
-`500b2496c364a6029430806678ebc7c04c218ad3` (previous drop:
-`23df1028b1e9f217a6920cf6b830c244fda9ebbf`).
+`5f76519` (`ea97ff7` + `5f76519` on top of the previous drop
+`500b2496c364a6029430806678ebc7c04c218ad3`).
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
 contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
@@ -10,6 +10,29 @@ The FI adapter is `flashinfer/moe_ep/shims/sm120/split_cutedsl/`.
 Backends use its package exports rather than raw modules.
 
 ## Changes since the previous drop
+
+- RTX 6000D (156 SMs, Green Context 8/8): the K1/K2 ready-queue DONE
+  sentinel count is `megamoe_kernel.ready_queue_done_sentinels(total_sms)`
+  (256 up to 128 SMs, unchanged kernels; 320 on 156 SMs, where the default
+  EP4 T16 grid has 312 K2 consumer CTAs). `api` passes it to every kernel.
+- Tuned tables are keyed by device (`device=[num_sms, min_partition,
+  alignment]`, absent = the original 110/8/8 tables); new 156-SM dsv41
+  `ep4_1numa` / `ep8_2numa` tables. New topologies `ep8_1domain` /
+  `ep16_2x1domain`; `select_compile_spec(..., ep_split_domain_size=)` carries
+  the real P2P-domain size of a folded p2p_split world (the shim passes it).
+- `MEGAMOE_P2P_DOMAIN=host` (opt-in, every rank): one P2P domain per host;
+  the session then sets `NCCL_P2P_LEVEL=SYS` and `NCCL_NET_DISABLE_INTRA=1`
+  so NCCL maps every local pair; the shim then selects `p2p_direct`.
+  Not a default: on the RTX 6000D host measured, concurrent cross-switch
+  P2P stores collapse and EP8 p2p_direct over both sockets is 1.2-4.6x
+  slower than `p2p_split`.
+- Cross-NUMA default is `p2p_split` at every token count on any device;
+  no rule selects the GIN ring any more (`select_legacy_config` rejects
+  unfolded cross-NUMA peers without an explicit backend).
+- Tuned-table anchors pin `k2_natural_regs` (new override) so an automatic
+  decode K2 N16 tile keeps its natural registers.
+
+## Changes in the `500b249` drop
 
 - t=0 FC1 weight prefetch (`MegaMoEKernelConfig.k1_t0_prefetch`, K tiles;
   heuristic default: the whole tile where push dispatch is the default, i.e.

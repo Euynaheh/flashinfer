@@ -203,6 +203,9 @@ class MegaMoEHeuristicInput:
     # p2p_split: cross-NUMA peers are served through local shadow segments
     # and are therefore counted as same-NUMA peers above.
     ep_numa_split: bool = False
+    # p2p_split only: GPUs per real P2P domain before folding (4 = one NUMA
+    # node of a 2 x 4 host; 8 = a whole host with MEGAMOE_P2P_DOMAIN=host).
+    ep_split_domain_size: int = 4
 
     @property
     def expected_rows_per_expert(self) -> float:
@@ -364,6 +367,10 @@ class MegaMoEHeuristicOverrides:
     push_dispatch: Optional[bool] = None
     # t=0 FC1 weight L2 prefetch in K tiles (None: 0 = off; see the config).
     k1_t0_prefetch: Optional[int] = None
+    # K2 register allocation (None: follows the K2 tile). Pinned by tuned-table
+    # anchors whose measured K2 N16 tile came from the automatic decode policy
+    # (which uses natural registers) rather than an explicit tile override.
+    k2_natural_regs: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -541,7 +548,11 @@ class MegaMoEKernelConfig:
                         else 2
                     )
                 ),
-                k2_natural_regs=(token_n == 32),
+                k2_natural_regs=(
+                    overrides.k2_natural_regs
+                    if overrides.k2_natural_regs is not None
+                    else token_n == 32
+                ),
                 k2_min_blocks_per_sm=2 if token_n == 32 else 1,
             )
 
@@ -645,6 +656,16 @@ def select_legacy_config(
     cross_numa = shape.ep_cross_numa_peer_count > 0
 
     if cross_numa:
+        # Unfolded cross-NUMA peers mean the GIN-ring transport, which is an
+        # explicit opt-in only: the default for a cross-NUMA EP world is
+        # p2p_split, which callers express by folding the cross peers into
+        # the same-domain count with ``ep_numa_split=True``.
+        if overrides is None or overrides.comm_backend is None:
+            raise ValueError(
+                "cross-NUMA EP peers without an explicit comm_backend: use "
+                "p2p_split (fold the cross peers into ep_same_numa_peer_count "
+                "and set ep_numa_split=True) or pass comm_backend explicitly"
+            )
         # The RTX Pro 5000 cross-NUMA scan selected 48/16/16/30. Preserve
         # those proportions on other SM120 devices and align explicit groups
         # to the device's Green Context co-schedule granularity.
@@ -1009,7 +1030,14 @@ def _with_tuned_table(shape, overrides):
     if "comm_backend" in user and user["comm_backend"] != table.get("comm_backend", "p2p_direct"):
         return overrides
     if not table or set(table) <= {"comm_backend", "token_back_mode"}:
-        return overrides  # the default won at this anchor: built-in selection stays in charge
+        # The default won at this anchor: built-in selection stays in charge,
+        # on the anchor's backend (a measured GIN-ring anchor of the 110-SM
+        # EP8 tables passes its backend explicitly; it is never a rule default).
+        if "comm_backend" in table and "comm_backend" not in user:
+            return replace(overrides or MegaMoEHeuristicOverrides(),
+                           comm_backend=table["comm_backend"],
+                           token_back_mode=user.get("token_back_mode", table.get("token_back_mode")))
+        return overrides
     # Knobs are changes relative to the built-in selection *at the anchor*.
     # Pin that selection's geometry so every token count mapped to the anchor
     # runs the measured configuration (the built-in tile choice changes with
@@ -1039,7 +1067,7 @@ _PINNED_FROM_ANCHOR = (
     "k1_tile", "k2_tile", "k2_stages", "k2_warps", "ready_queue_bundle",
     "k1_sms", "k2_sms", "tx_sms", "rx_sms", "k2_tail_reclaim", "dispatch_chunk_tokens",
     "rank_local_combine", "fc1_utility_postprocess", "k1_ctas_per_sm", "k1_stages",
-    "k2_launch_factor", "weight_prefetch_ahead",
+    "k2_launch_factor", "weight_prefetch_ahead", "k2_natural_regs",
 )
 
 
@@ -1176,7 +1204,13 @@ def _select_weight_cache_policy(shape, config, *, activation=False):
     for row in _builtin_policy().get("weight_cache", {}).get("ranges", []):
         if (row["ep"] == ep and row["signature"] == signature
                 and row["tokens"][0] <= shape.tokens_per_rank <= row["tokens"][1]):
-            reference, _ = _select_config_and_dispatch_base(shape)
+            # A cross-NUMA (GIN-ring) config is only ever an explicit opt-in;
+            # compare it with that backend's built-in preset.
+            reference, _ = _select_config_and_dispatch_base(
+                shape,
+                MegaMoEHeuristicOverrides(comm_backend=config.comm_backend,
+                                          token_back_mode=config.token_back_mode)
+                if shape.ep_cross_numa_peer_count > 0 else None)
             if config == reference:
                 return (row.get("activation", "default") if activation else "evict_first")
             break

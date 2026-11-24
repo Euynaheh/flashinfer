@@ -99,6 +99,18 @@ RANK_COMBINE_MAX_GROUPS = 4
 # =============================================================================
 
 
+def ready_queue_done_sentinels(total_sms: int) -> int:
+    """DONE sentinels at the end of the K1/K2 ready queues.
+
+    Every consumer CTA dequeues one sentinel, so the count bounds the consumer
+    grid (K2 + tail-drain CTAs, K1 CTAs); the runner rejects larger grids.
+    256 is kept for devices up to 128 SMs (110-SM RTX PRO 5000: unchanged
+    kernels); larger devices get 2 x SMs rounded up to a warp multiple
+    (RTX 6000D, 156 SMs: 320), enough for two CTAs on every SM.
+    """
+    return max(256, (2 * int(total_sms) + 31) // 32 * 32)
+
+
 @dataclasses.dataclass(frozen=True)
 class _RegionSpec:
     """One region in either the local or shared workspace.
@@ -234,6 +246,7 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
         k1_ready_queue_m_rotation: int = 0,
         dispatch_warp_count: int = 4,
         jit_config: Optional[Sm120JitConfig] = None,
+        ready_queue_done_sentinels: int = 256,
     ) -> None:
         if comm_backend not in ("p2p_direct", "nvshmem_ibgda"):
             raise ValueError(
@@ -585,11 +598,17 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
         k2_token_tiles_per_ready_block = (
             self.k2_ready_tile_tokens // self.k2_token_tile_tokens
         )
+        if ready_queue_done_sentinels < 256 or ready_queue_done_sentinels % 32:
+            raise ValueError(
+                "ready_queue_done_sentinels must be a multiple of 32 and at "
+                f"least 256, got {ready_queue_done_sentinels}"
+            )
+        self.ready_queue_done_sentinels = ready_queue_done_sentinels
         self.k2_ready_queue_capacity = (
             fc1_done_slots
             * queue_bundles_per_token_block
             * k2_token_tiles_per_ready_block
-        ) + 256
+        ) + ready_queue_done_sentinels
         self.k1_ready_queue_m_tiles = (
             self.intermediate_gateup + self.mma_tiler_mnk[0] - 1
         ) // self.mma_tiler_mnk[0]
@@ -598,7 +617,7 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
                 self.pool_task_tile_capacity
                 * self.k1_ready_queue_m_tiles
             )
-            + 256
+            + ready_queue_done_sentinels
             if self.k1_ready_queue_workspace
             else 0
         )

@@ -105,6 +105,14 @@ def select_comm_backend(config: "MegaMoESm120W4A8Config", topology: Any) -> str:
     stay direct and every cross-NUMA peer is served through a local shadow
     segment synchronized over NCCL GIN. The optional ``comm_backend`` knob may
     only confirm the backend that the discovered topology admits.
+
+    Hosts whose cross-socket P2P stays fast with every GPU storing at once can
+    run one P2P domain per host: ``MEGAMOE_P2P_DOMAIN=host`` (same value on
+    every rank) makes the discovered topology a single domain, so such a world
+    has no cross-NUMA peers and uses ``p2p_direct`` over all of them (the
+    session then maps every pair through NCCL LSA). Not a default: on RTX 6000D
+    hosts measured so far concurrent cross-switch stores collapse to ~1 GB/s
+    and EP8 p2p_direct over both sockets is slower than ``p2p_split``.
     """
 
     requested = (config.knobs or {}).get("comm_backend")
@@ -120,7 +128,9 @@ def select_comm_backend(config: "MegaMoESm120W4A8Config", topology: Any) -> str:
     if requested == "p2p_direct":
         raise ValueError(
             "this EP world spans NUMA nodes without P2P between them; "
-            "use comm_backend='p2p_split' (the default for this topology)"
+            "use comm_backend='p2p_split' (the default for this topology), or "
+            "set MEGAMOE_P2P_DOMAIN=host on every rank when every cross-socket "
+            "pair is P2P-mapped and fast (one P2P domain per host)"
         )
     from moe_sm120_mxfp4mxfp8_split.transport.nccl.shadow import ShadowLayout
     from moe_sm120_mxfp4mxfp8_split.tuned_table import SPLIT_MAX_EXPERTS_PER_RANK
@@ -456,6 +466,9 @@ class MegaMoESm120W4A8Frontend:
         )
         same_numa = topology.same_numa_peer_count
         cross_numa = topology.cross_numa_peer_count
+        # GPUs per real P2P domain (before folding): selects the tuned-table
+        # topology of a p2p_split world (4: 2 x 4 NUMA, 8: host domains).
+        split_domain_size = same_numa + 1
         p2p_split = self._p2p_split
         if p2p_split:
             # Same folded view as the standalone runner: one P2P group.
@@ -493,6 +506,7 @@ class MegaMoESm120W4A8Frontend:
                 overrides=self._heuristic_overrides(split_compatible=split_compatible),
                 jit=jit,
                 ep_numa_split=p2p_split,
+                ep_split_domain_size=split_domain_size,
             )
 
         spec = select(False)
