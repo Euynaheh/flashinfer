@@ -120,10 +120,21 @@ rows; records, the return path and same-NUMA sources are unchanged. At EP8
 off. `MEGAMOE_XNUMA_FSPLIT=1|2|4` (diagnostic) sets the forwarder CTAs per
 cross source; 2 (default) measured best at EP16.
 
-Opt-in, below the 1 % bar for a default: `MEGA_SPLIT_FUSED_RESET=1` issues the
-graph-owned replay reset as one fill kernel instead of a chain of fill nodes,
-and `MEGA_SPLIT_FENCED_PUBLISH=1` publishes a K1 ready tile with one fence
-and relaxed stores. Diagnostics: `MEGA_SPLIT_PHASE_STAMPS=1` records per-call
+Decode front path (default on; `MEGA_SPLIT_FUSED_RESET=0` /
+`MEGA_SPLIT_FENCED_PUBLISH=0` restore the old forms): the graph-owned replay
+reset is one fill kernel instead of a chain of fill nodes, and a K1 ready tile
+is published with one fence and relaxed stores. t=0 FC1 weight prefetch
+(`MegaMoEKernelConfig.k1_t0_prefetch`, K tiles; heuristic default: the whole
+tile for EP <= 8 up to `PUSH_DISPATCH_MAX_TOKENS` tokens per rank; table knob
+and `--k1_t0_prefetch`): the dispatch publishes each (expert, token tile)
+block at its static expert-major position in the K1 ready queue instead of in
+publish order, so the position a K1 scheduler warp claims at kernel entry
+tells which weight tile it will most likely run first (assuming every local
+expert holds one token tile); the warp prefetches that tile and its scales
+into L2 while the reset barrier, push and dispatch barrier run.
+`MEGA_SPLIT_K1_STATIC_ORDER=1` (diagnostic) gives the static order without
+the prefetch. DSv4.1 ABBA (all three vs none): EP8 T16/32/64 -1.5/-1.3/-1.4 %,
+EP4 -0.6/-0.5/-1.0 %. Diagnostics: `MEGA_SPLIT_PHASE_STAMPS=1` records per-call
 `%globaltimer` phase stamps (sender, K1 barriers/push/pull, K2, forwarder,
 scatter) that the runner prints after a `--pr_timing` run, and
 `MEGA_SPLIT_DIAG_JITTER_US=N` injects per-call 0..N us delays in K1 before the

@@ -31,6 +31,8 @@ SLOTS = (
     ("k1_dbar", "max"),       # CTA 0: after dispatch_barrier (counts known)
     ("k1_first_tile", "min"),
     ("k1_first_tile_last", "max"),
+    ("k1_tile2", "min"),          # compute warp 0 starts its second tile (first one done)
+    ("k1_tile2_last", "max"),
     ("k1_pull_done", "max"),  # last dispatch warp finished pulling
     ("k1_pull_exit_min", "min"),  # first dispatch warp out of the pull loop
     ("k1_row_min", "min"),    # first pulled row published

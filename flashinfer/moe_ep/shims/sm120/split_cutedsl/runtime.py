@@ -1046,7 +1046,7 @@ class MegaMoESm120W4A8Frontend:
         reset_dispatch_rank_cache: bool = True,
         fused: bool = False,
     ) -> None:
-        # fused=True (graph-owned reset, opt-in MEGA_SPLIT_FUSED_RESET=1): one
+        # fused=True (graph-owned reset, default on; MEGA_SPLIT_FUSED_RESET=0 off): one
         # fill kernel instead of a chain of per-region fill nodes in front of K1.
         fills: list[tuple[torch.Tensor, int]] = []
         kernel = execution.bundle.k1

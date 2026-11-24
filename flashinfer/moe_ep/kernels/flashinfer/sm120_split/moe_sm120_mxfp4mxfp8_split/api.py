@@ -46,7 +46,9 @@ from .jit_config import Sm120JitConfig
 # ABI42: widen FC2 workspace row indices after direct-stage mapping.
 # ABI44: push dispatch (same-NUMA input shadows, MegaMoEKernelConfig.push_dispatch)
 # and one fence per published K1 ready tile.
-KERNEL_CACHE_ABI = 44
+# ABI45: t=0 FC1 weight prefetch with static K1 ready-queue positions
+# (MegaMoEKernelConfig.k1_t0_prefetch).
+KERNEL_CACHE_ABI = 45
 
 
 @dataclass(frozen=True)
@@ -435,6 +437,10 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
             k1.num_ab_stages_soft_cap = 2
     if config.k1_stages is not None:
         k1.num_ab_stages_override = config.k1_stages
+    # t=0 FC1 weight prefetch: the K1 sched warp prefetches the weight tile of
+    # its first queue claim; the dispatch publishes at static queue positions.
+    k1.k1_t0_prefetch = config.k1_t0_prefetch
+    k1.token_comm.k1_static_order = config.k1_t0_prefetch > 0
 
     k2_load_balance = (
         "atomic_counter" if config.k2_tail_reclaim

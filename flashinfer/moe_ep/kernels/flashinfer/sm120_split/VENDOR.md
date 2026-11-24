@@ -1,8 +1,8 @@
 # SM120 W4A8 Split Kernel Drop
 
 This directory contains the SM120 MXFP4/MXFP8 split implementation at commit
-`23df1028b1e9f217a6920cf6b830c244fda9ebbf` (previous drop:
-`1864b29da454c9129737920814a2d9cd70b18d36`).
+`500b2496c364a6029430806678ebc7c04c218ad3` (previous drop:
+`23df1028b1e9f217a6920cf6b830c244fda9ebbf`).
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
 contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
@@ -10,6 +10,25 @@ The FI adapter is `flashinfer/moe_ep/shims/sm120/split_cutedsl/`.
 Backends use its package exports rather than raw modules.
 
 ## Changes since the previous drop
+
+- t=0 FC1 weight prefetch (`MegaMoEKernelConfig.k1_t0_prefetch`, K tiles;
+  heuristic default: the whole tile where push dispatch is the default, i.e.
+  up to 64 tokens per rank, on EP <= 8; table knob `k1_t0_prefetch`): the
+  dispatch publishes each (expert, token tile) block at its static
+  expert-major K1 ready-queue position, and each K1 scheduler warp prefetches
+  the weight tile (and scale atoms) of its first claimed position into L2
+  while the reset barrier, push and dispatch barrier run. `api` sets
+  `k1.k1_t0_prefetch` and `k1.token_comm.k1_static_order`, so the shim needs
+  no change. `KERNEL_CACHE_ABI=45`.
+- `MEGA_SPLIT_FUSED_RESET` and `MEGA_SPLIT_FENCED_PUBLISH` now default on
+  (`=0` restores the fill-node chain / a release per store); the shim's
+  fused graph reset follows `fused_fill.enabled()` as before.
+- Standalone measurements (host .16, DSv4.1-Flash, p50 us, 1864b29 ->
+  500b249): EP4 T16/32/64/128 1175.8/1402.3/1639.4/1666.2 ->
+  1167.4/1394.9/1623.7/1660.4; EP8 836.6/923.6/956.4/1077.5 ->
+  823.8/911.4/943.1/1076.0.
+
+## Changes in the previous drop (23df102)
 
 - `heuristic.check_launch_safety` (end of `select_config_and_dispatch`, so it
   covers heuristic defaults, tuned-table entries and caller overrides) rejects

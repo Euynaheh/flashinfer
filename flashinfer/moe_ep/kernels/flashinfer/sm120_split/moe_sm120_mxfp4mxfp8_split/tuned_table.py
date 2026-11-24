@@ -130,7 +130,7 @@ def overrides_for(knobs: dict) -> dict:
     if knobs.get("k2_n") is not None:
         out["k2_tile"] = (64, int(knobs["k2_n"]), 128)
     for key in ("k1_ctas_per_sm", "k2_launch_factor", "k1_stages", "weight_prefetch_ahead",
-                "dispatch_chunk_tokens"):
+                "dispatch_chunk_tokens", "k1_t0_prefetch"):
         if knobs.get(key) is not None:
             out[key] = int(knobs[key])
     if knobs.get("k2_warps") is not None:

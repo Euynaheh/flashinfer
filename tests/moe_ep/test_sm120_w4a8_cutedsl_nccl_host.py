@@ -416,6 +416,18 @@ def test_launch_guard_rejects_k2_residency_without_tail_reclaim(
     assert (ok.kernel.k2_launch_factor, ok.kernel.k2_tail_reclaim) == (2, True)
 
 
+@pytest.mark.parametrize("model", (DSV41, GLM53), ids=("dsv41", "glm53"))
+def test_k1_t0_prefetch_follows_push_dispatch(model) -> None:
+    from moe_sm120_mxfp4mxfp8_split.heuristic import K1_T0_PREFETCH_DEFAULT_K_TILES
+
+    for tokens in (16, 32, 64, 128):
+        expected = K1_T0_PREFETCH_DEFAULT_K_TILES if tokens <= 64 else 0
+        ep4 = _spec(model, tokens, ep=4, same=3, cross=0, split=False)
+        split = _spec(model, tokens, ep=8, same=7, cross=0, split=True)
+        assert ep4.kernel.k1_t0_prefetch == expected
+        assert split.kernel.k1_t0_prefetch == expected
+
+
 def test_push_shadow_stride_covers_the_staged_inputs() -> None:
     from flashinfer.moe_ep.shims.sm120.split_cutedsl import runtime as shim_runtime
     from flashinfer.moe_ep.shims.sm120.split_cutedsl.comm import page_bytes

@@ -24,9 +24,11 @@ _CHUNK = 16384
 
 
 def enabled() -> bool:
-    """Opt-in (MEGA_SPLIT_FUSED_RESET=1): DSv4.1 ABBA -0.4 to -0.5 % at EP4
-    16/32 tokens, flat at EP8, below the 1 % bar for a default."""
-    return os.environ.get("MEGA_SPLIT_FUSED_RESET", "0") == "1"
+    """Default on (MEGA_SPLIT_FUSED_RESET=0 restores the fill-node chain): K1
+    starts ~5 us earlier; with the fenced K1 ready-tile publish and the t=0
+    FC1 weight prefetch DSv4.1 decode is -0.5 to -1.5 % (EP4/EP8, 16-64
+    tokens per rank)."""
+    return os.environ.get("MEGA_SPLIT_FUSED_RESET", "1") == "1"
 
 
 def _pattern(t: torch.Tensor, value: int):

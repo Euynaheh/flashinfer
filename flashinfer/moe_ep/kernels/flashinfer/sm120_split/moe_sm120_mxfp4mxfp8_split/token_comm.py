@@ -53,11 +53,15 @@ from src.token_comm import CombineFormat, TokenInPullTokenBackPush, TokenSrcMeta
 # the reset barrier (late producer) and every dispatch warp before its pull
 # (late consumer), to exercise cross-rank buffer reuse.
 _DIAG_JITTER_US = int(os.environ.get("MEGA_SPLIT_DIAG_JITTER_US", "0"))
-# Opt-in (MEGA_SPLIT_FENCED_PUBLISH=1): publish a K1 ready tile with one fence
-# and relaxed stores instead of a release per store (per-row publish 20 -> 14
-# us under load; DSv4.1 ABBA -0.2 to -0.8 %, below the 1 % bar for a default).
-_FENCED_PUBLISH = os.environ.get("MEGA_SPLIT_FENCED_PUBLISH", "0") == "1"
+# Default on (MEGA_SPLIT_FENCED_PUBLISH=0 restores a release per store):
+# publish a K1 ready tile with one fence and relaxed stores (per-row publish
+# 20 -> 14 us under load). Alone -0.2 to -0.8 %; part of the decode front-path
+# set with the fused reset and the t=0 FC1 weight prefetch.
+_FENCED_PUBLISH = os.environ.get("MEGA_SPLIT_FENCED_PUBLISH", "1") == "1"
 _PUBLISH_SEM = "relaxed" if _FENCED_PUBLISH else "release"
+# Diagnostic (MEGA_SPLIT_K1_STATIC_ORDER=1): static K1 ready-queue positions
+# without the t=0 weight prefetch (see ``k1_static_order``).
+_K1_STATIC_ORDER_ENV = os.environ.get("MEGA_SPLIT_K1_STATIC_ORDER", "0") == "1"
 
 
 @dataclass(frozen=True)
@@ -529,6 +533,15 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             mask=0xFFFFFFFF,
             mask_and_clamp=31,
         )
+        if cutlass.const_expr(getattr(self, "k1_static_order", False) or _K1_STATIC_ORDER_ENV):
+            # Static order: the (expert, token tile) block lands at its dense
+            # expert-major position (task tiles before it x M tiles), so the
+            # first queue claims are known before dispatch (t=0 weight
+            # prefetch). The counter above still advances by the same amount,
+            # so the DONE sentinels land right after the last tile.
+            queue_begin = (
+                cumulative_token_block + tile_n_idx
+            ) * Int32(self.k1_ready_queue_m_tiles)
         for work_batch in cutlass.range_constexpr(
             0, (self.k1_ready_queue_m_tiles + 31) // 32
         ):

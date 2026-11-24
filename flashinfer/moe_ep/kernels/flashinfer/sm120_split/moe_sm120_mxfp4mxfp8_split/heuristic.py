@@ -155,6 +155,18 @@ RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT = 32.0
 # pushing every routed row costs more than the slower pull).
 PUSH_DISPATCH_MAX_TOKENS = 64
 
+# t=0 FC1 weight prefetch (``MegaMoEKernelConfig.k1_t0_prefetch``), in K tiles
+# of the K1 MMA tile; values above the K extent prefetch the whole tile. The
+# default prefetches each K1 CTA's whole expected first weight tile (and its
+# scales) for decode calls with push dispatch (up to PUSH_DISPATCH_MAX_TOKENS
+# tokens) on one host (EP <= 8). DSv4.1 ABBA on top of the fused reset and
+# the fenced publish: EP8 T16 -1.1 %, T32 -1.6 %; EP4 T16 -0.3 %. Prefetching a
+# second claim per CTA or pacing the stream measured slower (the burst
+# already delays the latency-bound reset barrier/push/prep by a few us).
+K1_T0_PREFETCH_MAX_K_TILES = 64
+K1_T0_PREFETCH_DEFAULT_K_TILES = K1_T0_PREFETCH_MAX_K_TILES
+K1_T0_PREFETCH_MAX_EP = 8
+
 # Packed p2p_split dispatch (``XnumaLayout.pack``): each source sends a cross
 # owner only the rows routed to it (staged in token order, plus a token ->
 # row map) instead of its whole input span. The span puts are NIC-bandwidth
@@ -350,6 +362,8 @@ class MegaMoEHeuristicOverrides:
     weight_prefetch_ahead: Optional[int] = None
     # Push dispatch (None: on for p2p_direct up to PUSH_DISPATCH_MAX_TOKENS).
     push_dispatch: Optional[bool] = None
+    # t=0 FC1 weight L2 prefetch in K tiles (None: 0 = off; see the config).
+    k1_t0_prefetch: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -416,6 +430,12 @@ class MegaMoEKernelConfig:
     # Sources push the routed input rows into same-NUMA owners' local shadows
     # (p2p_direct kernel transport only; the caller allocates the shadows).
     push_dispatch: bool = False
+    # t=0 FC1 weight prefetch: K1 ready-queue positions become static
+    # (expert-major order of the dispatched (expert, token-tile) blocks instead
+    # of publish order), and at K1 entry each K1 CTA prefetches into L2 the
+    # first ``k1_t0_prefetch`` K tiles of the weight tile its first claimed
+    # queue position is expected to hold (0 = off: dynamic publish order).
+    k1_t0_prefetch: int = 0
 
     def __post_init__(self):
         if self.weight_prefetch_ahead not in (0, 4, 8):
@@ -452,6 +472,13 @@ class MegaMoEKernelConfig:
             raise ValueError("push_dispatch needs the p2p_direct kernel transport and the token-strided pull")
         if self.weight_eviction_policy not in ("default", "evict_first"):
             raise ValueError("weight_eviction_policy must be default or evict_first")
+        if not 0 <= self.k1_t0_prefetch <= K1_T0_PREFETCH_MAX_K_TILES:
+            raise ValueError(f"k1_t0_prefetch must be 0..{K1_T0_PREFETCH_MAX_K_TILES} K tiles")
+        if self.k1_t0_prefetch and (self.kernel_comm_backend != "p2p_direct"
+                                    or self.dispatch_pull_mode != "token_strided"
+                                    or not self.k1_ready_queue):
+            raise ValueError("k1_t0_prefetch needs the p2p_direct kernel transport, the token-strided "
+                             "pull and the K1 ready queue")
 
     @property
     def total_sms(self) -> int:
@@ -992,7 +1019,8 @@ def _with_tuned_table(shape, overrides):
     anchor = replace(shape, tokens_per_rank=int(entry["tokens"]))
     measured, _ = _select_config_and_dispatch_base(
         anchor, MegaMoEHeuristicOverrides(**{k: v for k, v in table.items()
-                                             if k not in ("weight_eviction_policy", "push_dispatch")}))
+                                             if k not in ("weight_eviction_policy", "push_dispatch",
+                                                          "k1_t0_prefetch")}))
     merged = {name: getattr(measured, name) for name in _PINNED_FROM_ANCHOR}
     merged.update(table)
     if shape.expected_rows_per_expert > RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT:
@@ -1171,8 +1199,9 @@ def select_config_and_dispatch(shape, overrides=None, *, use_tuned_defaults=True
     if activation_explicit not in (None, "default", "evict_last"):
         raise ValueError("activation_eviction_policy must be default or evict_last")
     push_explicit = overrides.push_dispatch if overrides is not None else None
+    t0_explicit = overrides.k1_t0_prefetch if overrides is not None else None
     geometry_overrides = (replace(overrides, weight_eviction_policy=None, activation_eviction_policy=None,
-                                  push_dispatch=None)
+                                  push_dispatch=None, k1_t0_prefetch=None)
                           if overrides is not None else None)
     config, dispatch = _select_config_and_dispatch_base(
         shape, geometry_overrides, use_tuned_defaults=use_tuned_defaults)
@@ -1184,8 +1213,10 @@ def select_config_and_dispatch(shape, overrides=None, *, use_tuned_defaults=True
         _select_weight_cache_policy(shape, config, activation=True)
         if use_tuned_defaults else "default")
     push = push_explicit if push_explicit is not None else _select_push_dispatch(shape, config)
-    config = replace(config, weight_eviction_policy=policy,
-                     activation_eviction_policy=activation_policy, push_dispatch=push)
+    config = replace(config, weight_eviction_policy=policy, activation_eviction_policy=activation_policy,
+                     push_dispatch=push,
+                     k1_t0_prefetch=(t0_explicit if t0_explicit is not None
+                                     else _select_k1_t0_prefetch(shape, config)))
     check_launch_safety(shape, config)
     return config, dispatch
 
@@ -1213,6 +1244,17 @@ def check_launch_safety(shape, config) -> None:
             "set k2_tail_reclaim=on or k2_launch_factor=1")
 
 
+def _select_k1_t0_prefetch(shape, config) -> int:
+    """Default t=0 FC1 weight prefetch: where push dispatch is the default
+    (decode, p2p_direct with same-domain peers), on one host, with the K1
+    ready queue."""
+    return (K1_T0_PREFETCH_DEFAULT_K_TILES if (
+        _select_push_dispatch(shape, config)
+        and config.k1_ready_queue
+        and shape.expert_parallel_size <= K1_T0_PREFETCH_MAX_EP
+    ) else 0)
+
+
 def _select_push_dispatch(shape, config) -> bool:
     """Default push dispatch: decode-size p2p_direct worlds with peers."""
     return bool(
@@ -1232,6 +1274,8 @@ def select_megamoe_config(shape, overrides=None, *, use_tuned_defaults=True):
 
 __all__ = [
     "check_launch_safety",
+    "K1_T0_PREFETCH_DEFAULT_K_TILES",
+    "K1_T0_PREFETCH_MAX_K_TILES",
     "XNUMA_PACK_MIN_TOKENS",
     "select_xnuma_pack",
     "MegaMoEHeuristicInput",
